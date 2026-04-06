@@ -4,6 +4,8 @@ A high-performance C implementation of the [Catanatron](https://github.com/bcoll
 
 ## Performance
 
+### Single-threaded
+
 | Metric | Python (catanatron) | C (catanatron_c) | Speedup |
 |--------|-------------------|-------------------|---------|
 | Random vs Random | 119 games/sec | **20,480 games/sec** | **172x** |
@@ -11,6 +13,16 @@ A high-performance C implementation of the [Catanatron](https://github.com/bcoll
 | Binary size | ~50 MB (Python + deps) | **66 KB** | 775x smaller |
 | Dependencies | networkx, click, rich | **none** | - |
 | Lines of code | 5,729 (Python) | **2,813 (C)** | 2x smaller |
+
+### Multi-threaded (Apple M5 Max, 18 cores)
+
+| Metric | Single thread | 18 threads | Scaling |
+|--------|-------------|------------|---------|
+| R vs R (2p) | 20,480/sec | ~275,000/sec | 13x |
+| AB:2 vs AB:2 (2p) | 781/sec | ~9,900/sec | 13x |
+| AB:2 4-player | 282/sec | **3,654/sec** | 13x |
+
+See [PARALLEL.md](PARALLEL.md) for multi-threaded deployment instructions.
 
 AB:2 is the AlphaBeta search player at depth 2, the strongest bot configuration. It uses a hand-crafted 11-parameter linear evaluation function with alpha-beta pruning, move ordering, and free-ROLL depth semantics.
 
