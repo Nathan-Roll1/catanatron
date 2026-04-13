@@ -36,6 +36,7 @@ from human_bot.evaluate import compute_metrics, evaluate_vs_ab2
 from human_bot.loss import (
     FixedWeightLoss,
     UncertaintyWeightedLoss,
+    _build_action_weights,
     human_policy_loss,
     masked_entropy,
     value_loss,
@@ -138,11 +139,16 @@ def train_epoch(
             "action_mask": mask,
         })
 
+        is_winner = (vt[:, 0] > 0.5).float()
+        winner_boost = 1.0 + 0.5 * is_winner  # 1.5x for winner, 1.0x for others
+
         p_loss = human_policy_loss(
             out["policy_logits"], action_idx, mask,
             label_smoothing=cfg.label_smoothing,
+            winner_boost=winner_boost,
         )
-        v_loss = value_loss(out["value"], vt)
+        turn_progress = ff[:, 114]  # num_turns / 1000 from state encoder
+        v_loss = value_loss(out["value"], vt, turn_progress=turn_progress)
         ent = masked_entropy(out["policy_logits"], mask)
         total, _ = loss_combiner(p_loss, v_loss, ent, cfg.entropy_weight)
 

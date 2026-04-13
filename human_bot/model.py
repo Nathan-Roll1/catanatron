@@ -26,25 +26,26 @@ log = logging.getLogger(__name__)
 @dataclass
 class SmallNetworkConfig:
     # GNN encoder
-    gnn_layers: int = 3
-    gnn_hidden_dim: int = 48
-    gnn_output_dim: int = 80
+    gnn_layers: int = 4
+    gnn_hidden_dim: int = 64
+    gnn_output_dim: int = 128
 
     # Trunk
-    trunk_blocks: int = 4
-    trunk_channels: int = 80
+    trunk_blocks: int = 6
+    trunk_channels: int = 128
     trunk_activation: str = "mish"
 
     # Heads
-    policy_hidden_dim: int = 80
-    scorer_hidden_dim: int = 32
-    value_head_hidden: int = 64
+    policy_hidden_dim: int = 128
+    scorer_hidden_dim: int = 48
+    value_head_hidden: int = 128
 
     # Input dims (fixed by state encoder)
     node_feature_dim: int = 18
     edge_feature_dim: int = 5
     flat_feature_dim: int = 115
     action_space_size: int = 397  # 337 base + 60 trade offers (1:1, 1:2, 2:1)
+    mask_as_input: bool = True    # feed action mask as trunk input feature
 
 
 # ======================================================================
@@ -169,8 +170,33 @@ class SmallTrunk(nn.Module):
 # Heads
 # ======================================================================
 
+# Action type index -> (start, end) in the flat 397-dim action space
+_TYPE_RANGES = [
+    (0, 1),      # 0: ROLL
+    (1, 2),      # 1: END_TURN
+    (2, 3),      # 2: BUY_DEV
+    (3, 4),      # 3: PLAY_KNIGHT
+    (4, 5),      # 4: ROAD_BUILDING
+    (5, 59),     # 5: BUILD_SETTLEMENT (54)
+    (59, 113),   # 6: BUILD_CITY (54)
+    (113, 185),  # 7: BUILD_ROAD (72)
+    (185, 280),  # 8: MOVE_ROBBER (95)
+    (280, 310),  # 9: DISCARD + YOP + MONOPOLY (30)
+    (310, 330),  # 10: MARITIME (20)
+    (330, 397),  # 11: TRADE (67)
+]
+NUM_ACTION_TYPES = len(_TYPE_RANGES)
+
+
 class SmallSpatialPolicyHead(nn.Module):
-    """Compact spatial policy head with configurable hidden dimensions."""
+    """Hierarchical policy head: predict action type first, then sub-action.
+
+    Level 1: 12-way type classification (ROLL, END_TURN, BUY_DEV, ...)
+    Level 2: spatial scorers for position within type
+
+    Output is still a flat 397-dim logit vector for compatibility, computed as
+    log P(type) + log P(position | type).
+    """
 
     def __init__(self, cfg: SmallNetworkConfig,
                  road_pairs: torch.Tensor, tile_nodes: torch.Tensor) -> None:
@@ -183,9 +209,20 @@ class SmallSpatialPolicyHead(nn.Module):
         self.trunk_norm = nn.LayerNorm(T)
         self.node_norm = nn.LayerNorm(H)
 
-        self.global_fc = nn.Sequential(
+        self.type_fc = nn.Sequential(
             nn.Linear(T, PH), nn.BatchNorm1d(PH), nn.Mish(),
-            nn.Linear(PH, cfg.action_space_size),
+            nn.Linear(PH, NUM_ACTION_TYPES),
+        )
+
+        # Sub-action heads for grouped non-spatial types
+        self.discard_yop_mono_fc = nn.Sequential(
+            nn.Linear(T, SH), nn.Mish(), nn.Linear(SH, 30),
+        )
+        self.maritime_fc = nn.Sequential(
+            nn.Linear(T, SH), nn.Mish(), nn.Linear(SH, 20),
+        )
+        self.trade_fc = nn.Sequential(
+            nn.Linear(T, SH), nn.Mish(), nn.Linear(SH, 67),
         )
 
         ctx_dim = T + H
@@ -203,36 +240,70 @@ class SmallSpatialPolicyHead(nn.Module):
         tn = self.trunk_norm(trunk_out)
         nn_ = self.node_norm(node_emb)
 
-        global_logits = self.global_fc(tn)
+        # Level 1: type logits (B, 12)
+        type_logits = self.type_fc(tn)
+        log_type = F.log_softmax(type_logits, dim=-1)
 
+        # Level 2: sub-action logits per type
+        # Spatial scorers
         ctx = torch.cat([tn.unsqueeze(1).expand(-1, N, -1), nn_], dim=-1)
-        sett = self.settlement_scorer(ctx).squeeze(-1)
-        city = self.city_scorer(ctx).squeeze(-1)
+        sett_raw = self.settlement_scorer(ctx).squeeze(-1)       # (B, 54)
+        city_raw = self.city_scorer(ctx).squeeze(-1)              # (B, 54)
 
         src = nn_[:, self.road_pairs[:, 0], :]
         dst = nn_[:, self.road_pairs[:, 1], :]
         road_ctx = torch.cat([tn.unsqueeze(1).expand(-1, 72, -1), src, dst], dim=-1)
-        road = self.road_scorer(road_ctx).squeeze(-1)
+        road_raw = self.road_scorer(road_ctx).squeeze(-1)         # (B, 72)
 
         tile_emb = nn_[:, self.tile_nodes, :].mean(dim=2)
         tile_ctx = torch.cat([tn.unsqueeze(1).expand(-1, 19, -1), tile_emb], dim=-1)
-        robber = self.robber_scorer(tile_ctx).reshape(B, 95)
+        robber_raw = self.robber_scorer(tile_ctx).reshape(B, 95)  # (B, 95)
 
-        return torch.cat([
-            global_logits[:, :5], sett, city, road, robber, global_logits[:, 280:],
-        ], dim=1)  # total = 5 + 54 + 54 + 72 + 95 + (action_space-280) = action_space
+        # Non-spatial grouped sub-actions
+        dym_raw = self.discard_yop_mono_fc(tn)   # (B, 30)
+        mar_raw = self.maritime_fc(tn)            # (B, 20)
+        trade_raw = self.trade_fc(tn)             # (B, 67)
+
+        # Compose: log P(action) = log P(type) + log P(sub | type)
+        # For singletons (size 1), log P(sub|type) = 0
+        out = torch.empty(B, 397, device=tn.device, dtype=tn.dtype)
+
+        # Singletons: just the type log-prob
+        out[:, 0] = log_type[:, 0]    # ROLL
+        out[:, 1] = log_type[:, 1]    # END_TURN
+        out[:, 2] = log_type[:, 2]    # BUY_DEV
+        out[:, 3] = log_type[:, 3]    # PLAY_KNIGHT
+        out[:, 4] = log_type[:, 4]    # ROAD_BUILDING
+
+        # Spatial types: type prob + sub-action conditional
+        out[:, 5:59] = log_type[:, 5:6] + F.log_softmax(sett_raw, dim=-1)
+        out[:, 59:113] = log_type[:, 6:7] + F.log_softmax(city_raw, dim=-1)
+        out[:, 113:185] = log_type[:, 7:8] + F.log_softmax(road_raw, dim=-1)
+        out[:, 185:280] = log_type[:, 8:9] + F.log_softmax(robber_raw, dim=-1)
+
+        # Grouped non-spatial types
+        out[:, 280:310] = log_type[:, 9:10] + F.log_softmax(dym_raw, dim=-1)
+        out[:, 310:330] = log_type[:, 10:11] + F.log_softmax(mar_raw, dim=-1)
+        out[:, 330:397] = log_type[:, 11:12] + F.log_softmax(trade_raw, dim=-1)
+
+        return out
 
 
 class SmallValueHead(nn.Module):
     def __init__(self, trunk_channels: int, hidden_dim: int = 64) -> None:
         super().__init__()
         self.fc1 = nn.Linear(trunk_channels, hidden_dim)
-        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
         self.act = nn.Mish()
+        self.res1 = ResidualBlock(hidden_dim)
+        self.res2 = ResidualBlock(hidden_dim)
         self.fc_out = nn.Linear(hidden_dim, 4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc_out(self.act(self.bn(self.fc1(x))))
+        x = self.act(self.bn1(self.fc1(x)))
+        x = self.res1(x)
+        x = self.res2(x)
+        return self.fc_out(x)
 
 
 # ======================================================================
@@ -255,6 +326,8 @@ class HumanBotNet(nn.Module):
         self.board_encoder = SmallBoardEncoder(cfg)
 
         trunk_input = cfg.gnn_output_dim + cfg.flat_feature_dim
+        if cfg.mask_as_input:
+            trunk_input += cfg.action_space_size
         self.trunk = SmallTrunk(trunk_input, cfg.trunk_channels, cfg.trunk_blocks)
 
         road_pairs, tile_nodes = self._compute_topology()
@@ -306,13 +379,18 @@ class HumanBotNet(nn.Module):
         board_emb, node_emb = self.board_encoder(
             batch["node_features"], batch["edge_index"], batch["edge_features"],
         )
-        combined = torch.cat([board_emb, batch["flat_features"]], dim=-1)
+
+        parts = [board_emb, batch["flat_features"]]
+        mask = batch.get("action_mask")
+        if self.config.mask_as_input and mask is not None:
+            parts.append(mask)
+        combined = torch.cat(parts, dim=-1)
+
         trunk_out = self.trunk(combined)
 
         raw_logits = self.policy_head(trunk_out, node_emb)
         value = self.value_head(trunk_out)
 
-        mask = batch.get("action_mask")
         if mask is not None:
             fill_val = -6e4 if raw_logits.dtype == torch.float16 else -1e9
             masked_logits = raw_logits.masked_fill(~mask.bool(), fill_val)

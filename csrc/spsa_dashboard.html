@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Paired SPSA Gradient Descent</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:'SF Mono','Menlo',monospace;font-size:13px}
+.header{padding:12px 20px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:16px;font-weight:600;color:#58a6ff}
+.stats{display:flex;gap:24px}
+.stat .val{font-size:20px;font-weight:700;color:#f0f6fc}
+.stat .lbl{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:1px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px;height:calc(100vh - 52px)}
+.panel{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:12px;overflow:hidden}
+.panel h2{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+canvas{width:100%;height:calc(100% - 24px)}
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Paired SPSA Gradient Descent</h1>
+    <div class="stats">
+        <div class="stat"><div class="val" id="sIter">0</div><div class="lbl">Iterations</div></div>
+        <div class="stat"><div class="val" id="sGames">0</div><div class="lbl">Games</div></div>
+        <div class="stat"><div class="val" id="sGps">0</div><div class="lbl">Games/sec</div></div>
+        <div class="stat"><div class="val" id="sTime">0:00</div><div class="lbl">Elapsed</div></div>
+    </div>
+</div>
+<div class="grid">
+    <div class="panel"><h2>Parameter Drift from Baseline (% change over time)</h2><canvas id="driftChart"></canvas></div>
+    <div class="panel"><h2>Current Parameter Values (% from baseline)</h2><canvas id="barChart"></canvas></div>
+    <div class="panel"><h2>Gradient Signal (plus WR - 0.5, per iteration)</h2><canvas id="gradChart"></canvas></div>
+    <div class="panel"><h2>Plus vs Minus Win Count</h2><canvas id="wrChart"></canvas></div>
+</div>
+<script>
+const WN=['vps','prod','eprod','tiles','buildable','road','synergy','hand','discard','devs','army'];
+const COLORS=['#ff7b72','#79c0ff','#7ee787','#d2a8ff','#ffa657','#ff9bce','#a5d6ff','#f0e68c','#ffd700','#98fb98','#dda0dd'];
+let data=[];let lastLen=0;
+
+function fetchData(){
+    fetch('/data?'+Date.now()).then(r=>r.text()).then(text=>{
+        const lines=text.trim().split('\n').filter(l=>l.length>0);
+        if(lines.length<=lastLen)return;lastLen=lines.length;
+        data=lines.map(l=>{try{return JSON.parse(l)}catch(e){return null}}).filter(x=>x&&x.iter);
+        if(data.length>0)render();
+    }).catch(()=>{});
+}
+
+function render(){
+    const last=data[data.length-1];
+    document.getElementById('sIter').textContent=last.iter;
+    document.getElementById('sGames').textContent=(last.games/1000).toFixed(0)+'k';
+    document.getElementById('sGps').textContent=last.gps.toFixed(0);
+    const m=Math.floor(last.elapsed/60),s=Math.floor(last.elapsed%60);
+    document.getElementById('sTime').textContent=m+':'+(s<10?'0':'')+s;
+    drawDrift();drawBar(last);drawGrad();drawWr();
+}
+
+function setup(id){
+    const c=document.getElementById(id);const r=c.parentElement.getBoundingClientRect();
+    const w=r.width-24,h=r.height-36;c.width=w*2;c.height=h*2;c.style.width=w+'px';c.style.height=h+'px';
+    const ctx=c.getContext('2d');ctx.scale(2,2);return{ctx,w,h};
+}
+
+function drawDrift(){
+    const{ctx,w,h}=setup('driftChart');ctx.clearRect(0,0,w,h);
+    if(data.length<2)return;
+    const ml=50,mr=10,mt=10,mb=20,pw=w-ml-mr,ph=h-mt-mb;
+    const n=Math.min(data.length,500),start=data.length-n;
+    let maxD=0.05;
+    for(let i=start;i<data.length;i++)for(let j=0;j<11;j++)if(Math.abs(data[i].pct[j])>maxD)maxD=Math.abs(data[i].pct[j]);
+    maxD=Math.ceil(maxD*10)/10;
+    ctx.strokeStyle='#21262d';ctx.lineWidth=0.5;ctx.fillStyle='#484f58';ctx.font='9px monospace';
+    for(let y=-maxD;y<=maxD;y+=maxD/2){
+        const py=mt+ph/2-(y/maxD)*(ph/2);
+        ctx.beginPath();ctx.moveTo(ml,py);ctx.lineTo(w-mr,py);ctx.stroke();
+        ctx.textAlign='right';ctx.fillText(y.toFixed(2)+'%',ml-4,py+3);
+    }
+    const zero=mt+ph/2;ctx.strokeStyle='#f85149';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(ml,zero);ctx.lineTo(w-mr,zero);ctx.stroke();ctx.setLineDash([]);
+    const step=pw/Math.max(n-1,1);
+    for(let j=0;j<11;j++){
+        ctx.strokeStyle=COLORS[j];ctx.lineWidth=1.2;ctx.globalAlpha=0.7;ctx.beginPath();
+        for(let i=0;i<n;i++){
+            const x=ml+i*step,y=mt+ph/2-(data[start+i].pct[j]/maxD)*(ph/2);
+            if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+        }
+        ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+    ctx.font='9px monospace';ctx.textAlign='left';
+    for(let j=0;j<11;j++){
+        ctx.fillStyle=COLORS[j];
+        ctx.fillText(WN[j],w-mr-60,mt+12+j*11);
+    }
+}
+
+function drawBar(last){
+    const{ctx,w,h}=setup('barChart');ctx.clearRect(0,0,w,h);
+    const ml=70,mr=10,mt=10,mb=10,pw=w-ml-mr,ph=h-mt-mb;
+    const bh=ph/11-2;
+    let maxP=0.05;for(let i=0;i<11;i++)if(Math.abs(last.pct[i])>maxP)maxP=Math.abs(last.pct[i]);
+    maxP=Math.ceil(maxP*20)/20;
+    const cx=ml+pw/2;
+    ctx.strokeStyle='#484f58';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(cx,mt);ctx.lineTo(cx,h-mb);ctx.stroke();
+    for(let i=0;i<11;i++){
+        const y=mt+i*(ph/11);const pct=last.pct[i];
+        const bw=Math.min(Math.abs(pct),maxP)/maxP*(pw/2);
+        ctx.fillStyle=pct>=0?'#7ee787':'#ff7b72';ctx.globalAlpha=0.7;
+        if(pct>=0)ctx.fillRect(cx,y,bw,bh);else ctx.fillRect(cx-bw,y,bw,bh);
+        ctx.globalAlpha=1;ctx.fillStyle='#8b949e';ctx.font='10px monospace';ctx.textAlign='right';
+        ctx.fillText(WN[i],ml-4,y+bh/2+4);
+        ctx.fillStyle='#c9d1d9';ctx.font='9px monospace';ctx.textAlign='left';
+        ctx.fillText(pct.toFixed(3)+'%',pct>=0?cx+bw+4:cx-bw-40,y+bh/2+3);
+    }
+}
+
+function drawGrad(){
+    const{ctx,w,h}=setup('gradChart');ctx.clearRect(0,0,w,h);
+    if(data.length<2)return;
+    const ml=40,mr=10,mt=10,mb=20,pw=w-ml-mr,ph=h-mt-mb;
+    const n=Math.min(data.length,200),start=data.length-n;
+    const zero=mt+ph/2;
+    ctx.strokeStyle='#484f58';ctx.lineWidth=0.5;
+    ctx.beginPath();ctx.moveTo(ml,zero);ctx.lineTo(w-mr,zero);ctx.stroke();
+    const step=pw/Math.max(n-1,1);
+    for(let i=0;i<n;i++){
+        const x=ml+i*step;const g=data[start+i].grad;
+        const bh=Math.abs(g)*ph;
+        ctx.fillStyle=g>=0?'#7ee78744':'#ff7b7244';
+        if(g>=0)ctx.fillRect(x-1,zero-bh,3,bh);
+        else ctx.fillRect(x-1,zero,3,bh);
+    }
+}
+
+function drawWr(){
+    const{ctx,w,h}=setup('wrChart');ctx.clearRect(0,0,w,h);
+    if(data.length<10)return;
+    const ml=40,mr=10,mt=10,mb=20,pw=w-ml-mr,ph=h-mt-mb;
+    const win=20;const n=Math.min(data.length,300),start=data.length-n;
+    const avg=[];
+    for(let i=win;i<n;i++){
+        let sp=0,sm=0;
+        for(let j=i-win;j<i;j++){sp+=data[start+j].pw;sm+=data[start+j].mw;}
+        avg.push(sp/(sp+sm+1e-10));
+    }
+    ctx.strokeStyle='#21262d';ctx.lineWidth=0.5;
+    const bl=mt+ph/2;ctx.strokeStyle='#f85149';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(ml,bl);ctx.lineTo(w-mr,bl);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle='#f85149';ctx.font='9px monospace';ctx.fillText('50%',ml+4,bl-4);
+    const step=pw/Math.max(avg.length-1,1);
+    ctx.strokeStyle='#58a6ff';ctx.lineWidth=2;ctx.beginPath();
+    for(let i=0;i<avg.length;i++){
+        const x=ml+i*step,y=mt+ph-(avg[i]-0.4)/(0.6-0.4)*ph;
+        if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    ctx.fillStyle='#484f58';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText('60%',ml-4,mt+4);ctx.fillText('40%',ml-4,h-mb);
+}
+
+setInterval(fetchData,1000);fetchData();
+</script>
+</body>
+</html>

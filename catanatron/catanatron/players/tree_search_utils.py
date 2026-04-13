@@ -188,10 +188,9 @@ def prune_robber_actions(current_color, game, actions):
         game_copy = game.copy()
         game_copy.execute(action)
 
-        our_production_sample = production_features(game_copy, current_color)
-        enemy_production_sample = production_features(game_copy, current_color)
-        production = value_production(our_production_sample, "P0")
-        enemy_production = value_production(enemy_production_sample, "P1")
+        production_sample = production_features(game_copy, current_color)
+        production = value_production(production_sample, "P0")
+        enemy_production = value_production(production_sample, "P1")
 
         return enemy_production - production
 

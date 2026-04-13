@@ -298,12 +298,13 @@ class Board:
 
     def copy(self):
         board = Board(self.map, initialize=False)
-        board.map = self.map  # reuse since its immutable
+        board.map = self.map
         board.buildings = self.buildings.copy()
         board.roads = self.roads.copy()
-        board.connected_components = pickle.loads(
-            pickle.dumps(self.connected_components)
-        )
+        cc = defaultdict(list)
+        for color, components in self.connected_components.items():
+            cc[color] = [s.copy() for s in components]
+        board.connected_components = cc
         board.board_buildable_ids = self.board_buildable_ids.copy()
         board.road_lengths = self.road_lengths.copy()
         board.road_color = self.road_color
@@ -311,10 +312,14 @@ class Board:
 
         board.robber_coordinate = self.robber_coordinate
         board.buildable_subgraph = self.buildable_subgraph
-        board.buildable_edges_cache = copy.deepcopy(self.buildable_edges_cache)
-        board.player_port_resources_cache = copy.deepcopy(
-            self.player_port_resources_cache
-        )
+        board.buildable_edges_cache = {
+            k: v.copy() if isinstance(v, list) else v
+            for k, v in self.buildable_edges_cache.items()
+        }
+        board.player_port_resources_cache = {
+            k: list(v) if isinstance(v, list) else v
+            for k, v in self.player_port_resources_cache.items()
+        }
         return board
 
     # ===== Helper functions

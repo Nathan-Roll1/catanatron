@@ -1,0 +1,5 @@
+catan_player
+__pycache__/
+*.pyc
+*.o
+*.dSYM/

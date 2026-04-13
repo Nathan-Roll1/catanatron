@@ -48,6 +48,21 @@ COL_EDGE_TO_ACTION_IDX: dict[int, int] = {
 }
 
 COL_RES_TO_ENGINE: dict[int, int] = {0: -1, 1: 1, 2: 2, 3: 3, 4: 4, 5: 0}
+
+# Port edge positions are FIXED for all standard Catan games; only the port
+# TYPE is shuffled per game.  Maps Colonist portEdgeState (x,y,z) to the two
+# engine compact-node IDs that receive the port benefit.
+COL_PORT_POS_TO_NODES: dict[tuple[int, int, int], tuple[int, int]] = {
+    (-2, 1, 1): (38, 39),
+    (-2, 2, 2): (35, 36),
+    (-1, -1, 1): (40, 44),
+    (-1, 3, 0): (32, 33),
+    (0, -2, 0): (45, 47),
+    (1, 2, 0): (28, 29),
+    (2, -3, 2): (48, 49),
+    (3, -2, 2): (52, 53),
+    (3, 0, 1): (25, 26),
+}
 COL_CARD_ENUM_TO_RES: dict[int, int] = {1: 1, 2: 2, 3: 3, 4: 4, 5: 0}
 
 NUM_NODES = 54
@@ -138,6 +153,7 @@ def _encode_state(
     play_order: list[int],
     production: np.ndarray,
     port_oh: np.ndarray,
+    action_name: str = "",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build (54,18) node, (144,5) edge, (115,) flat tensors from Colonist state."""
 
@@ -241,29 +257,35 @@ def _encode_state(
         dcs = state.get("mechanicDevelopmentCardsState", {}).get("players", {}).get(str(pc), {})
         dev_hand = dcs.get("developmentCards", {}).get("cards", []) if isinstance(dcs, dict) else []
         dev_used = dcs.get("developmentCardsUsed", []) if isinstance(dcs, dict) else []
-        dev_counts = [0] * 5  # knight, yop, monopoly, road_building, vp
+        # C engine dev order: 0=knight, 1=yop, 2=monopoly, 3=road_building, 4=vp
+        # Colonist enums: 10/11=knight, 12=yop, 13=monopoly, 14=road_building, 15=vp
+        dev_counts = [0] * 5
         for c in dev_hand:
             if c in (10, 11):
-                dev_counts[0] += 1
-            elif c == 15:
-                dev_counts[1] += 1
-            elif c in (12, 13):
-                dev_counts[2] += 1
+                dev_counts[0] += 1   # knight
+            elif c == 12:
+                dev_counts[1] += 1   # year of plenty
+            elif c == 13:
+                dev_counts[2] += 1   # monopoly
             elif c == 14:
-                dev_counts[3] += 1
+                dev_counts[3] += 1   # road building
+            elif c == 15:
+                dev_counts[4] += 1   # victory point
         for r in range(5):
             flat[o + 6 + r] = dev_counts[r] / 14.0
 
         played_counts = [0] * 5
         for c in dev_used:
             if c in (10, 11):
-                played_counts[0] += 1
-            elif c == 15:
-                played_counts[1] += 1
-            elif c in (12, 13):
-                played_counts[2] += 1
+                played_counts[0] += 1   # knight
+            elif c == 12:
+                played_counts[1] += 1   # yop
+            elif c == 13:
+                played_counts[2] += 1   # monopoly
             elif c == 14:
-                played_counts[3] += 1
+                played_counts[3] += 1  # road building
+            elif c == 15:
+                played_counts[4] += 1  # vp
         for r in range(5):
             flat[o + 11 + r] = played_counts[r]
 
@@ -305,10 +327,39 @@ def _encode_state(
     dev_bank_cards = dev_bank.get("cards", []) if isinstance(dev_bank, dict) else []
     flat[o1 + 5] = len(dev_bank_cards) / 25.0
 
-    # Phase
+    # Phase (dims 102-114) — must match C engine's StateEncoder exactly
+    # C engine prompts: 0=BUILD_INITIAL_SETTLEMENT, 1=BUILD_INITIAL_ROAD,
+    # 2=PLAY_TURN, 3=DISCARD, 4=MOVE_ROBBER, 5=DECIDE_TRADE, 6=DECIDE_ACCEPTEES
     o2 = o1 + 6  # 102
     cs_data = state.get("currentState", {})
+    ds = state.get("diceState", {})
     turn_count = cs_data.get("completedTurns", 0)
+    has_rolled = ds.get("diceThrown", False)
+    is_setup = turn_count < 8
+
+    is_robber_phase = action_name == "robber"
+    is_discard_phase = action_name == "discard"
+    is_road_building_phase = action_name in ("play_road_building", "road") and \
+        any(dcs_p.get("hasUsedDevelopmentCardThisTurn", False)
+            for dcs_p in state.get("mechanicDevelopmentCardsState", {}).get("players", {}).values()
+            if isinstance(dcs_p, dict))
+
+    is_setup_road = is_setup and action_name == "road"
+    if is_setup and not is_setup_road:
+        flat[o2 + 0] = 1.0  # PROMPT_BUILD_INITIAL_SETTLEMENT
+    elif is_setup_road:
+        flat[o2 + 1] = 1.0  # PROMPT_BUILD_INITIAL_ROAD
+    elif is_discard_phase:
+        flat[o2 + 3] = 1.0  # PROMPT_DISCARD
+    elif is_robber_phase:
+        flat[o2 + 4] = 1.0  # PROMPT_MOVE_ROBBER
+    else:
+        flat[o2 + 2] = 1.0  # PROMPT_PLAY_TURN
+
+    flat[o2 + 7] = float(is_setup)              # is_initial_build_phase
+    flat[o2 + 8] = float(is_discard_phase)       # is_discarding
+    flat[o2 + 9] = float(is_road_building_phase) # is_road_building
+    flat[o2 + 10] = float(is_robber_phase)       # is_moving_knight
     flat[o2 + 12] = turn_count / 1000.0
 
     return nf, ef, flat
@@ -344,7 +395,12 @@ def _compute_production(state: dict, topo: dict) -> np.ndarray:
 
 
 def _compute_port_oh(state: dict) -> np.ndarray:
-    """Compute per-node port one-hot (54, 7) from Colonist port data."""
+    """Compute per-node port one-hot (54, 7) from Colonist port data.
+
+    Feature columns: [none, wood, brick, sheep, wheat, ore, generic].
+    Colonist port types: 1=generic(3:1), 2=brick(2:1), 3=wool(2:1),
+                         4=grain(2:1), 5=ore(2:1), 6=lumber(2:1).
+    """
     port_oh = np.zeros((NUM_NODES, 7), dtype=np.float32)
     port_oh[:, 0] = 1.0  # default: no port
 
@@ -352,21 +408,24 @@ def _compute_port_oh(state: dict) -> np.ndarray:
     if not ps:
         return port_oh
 
-    # Colonist port type → feature index: 1=brick→2, 2=wool→3, 3=grain→4, 4=ore→5, 5=lumber→1, 6=generic→6
-    port_type_map = {1: 2, 2: 3, 3: 4, 4: 5, 5: 1, 6: 6}
+    # Colonist port type -> node feature column index
+    # Engine order: [none=0, wood=1, brick=2, sheep=3, wheat=4, ore=5, generic=6]
+    port_type_to_feat = {1: 6, 2: 2, 3: 3, 4: 4, 5: 5, 6: 1}
 
     for _, pdata in ps.items():
         if not isinstance(pdata, dict):
             continue
         ptype = pdata.get("type")
-        feat_idx = port_type_map.get(ptype)
+        feat_idx = port_type_to_feat.get(ptype)
         if feat_idx is None:
             continue
-        # Port is at an edge position. Find the two corners.
-        # Use the Colonist playerStates.bankTradeRatiosState to determine
-        # which corners have ports (when a player builds there, their ratio changes).
-        # For now, skip per-node port assignment — use default "no port".
-        # TODO: map port positions via edge endpoints
+        pos = (pdata.get("x"), pdata.get("y"), pdata.get("z"))
+        nodes = COL_PORT_POS_TO_NODES.get(pos)
+        if nodes is None:
+            continue
+        for n in nodes:
+            port_oh[n, 0] = 0.0
+            port_oh[n, feat_idx] = 1.0
 
     return port_oh
 
@@ -480,7 +539,8 @@ def _parse_event(event: dict) -> list[dict]:
 # Action index computation
 # ======================================================================
 
-def _action_to_index(parsed: dict, state: dict, topo: dict) -> int | None:
+def _action_to_index(parsed: dict, state: dict, topo: dict,
+                     play_order: list[int] | None = None) -> int | None:
     """Convert a parsed Colonist action to a 337-dim action index."""
     act = parsed["action"]
 
@@ -518,7 +578,14 @@ def _action_to_index(parsed: dict, state: dict, topo: dict) -> int | None:
         if col_hex is not None:
             c_tile = topo["col_hex_to_c_tile"].get(col_hex)
             if c_tile is not None:
-                return 185 + c_tile * 5 + 4  # steal slot 4 = no steal
+                victim_color = parsed.get("steal_victim_color")
+                if victim_color is not None and play_order:
+                    try:
+                        victim_seat = play_order.index(victim_color)
+                        return 185 + c_tile * 5 + victim_seat
+                    except ValueError:
+                        pass
+                return 185 + c_tile * 5 + 4  # no steal
 
     if act == "discard":
         card_enums = parsed.get("card_enums", [])
@@ -566,6 +633,33 @@ def _action_to_index(parsed: dict, state: dict, topo: dict) -> int | None:
 # Action mask construction from Colonist state
 # ======================================================================
 
+def _get_player_resources(state: dict, color: int) -> list[int]:
+    """Extract [wood, brick, sheep, wheat, ore] counts for a player."""
+    ps = state.get("playerStates", {}).get(str(color), {})
+    rc = ps.get("resourceCards", {})
+    cards = rc.get("cards", []) if isinstance(rc, dict) else []
+    counts = [0] * 5
+    for c in cards:
+        r = COL_CARD_ENUM_TO_RES.get(c)
+        if r is not None:
+            counts[r] += 1
+    return counts
+
+
+def _get_player_dev_cards(state: dict, color: int) -> list[int]:
+    """Extract [knight, yop, monopoly, road_building, vp] dev card counts."""
+    dcs = state.get("mechanicDevelopmentCardsState", {}).get("players", {}).get(str(color), {})
+    dev_hand = dcs.get("developmentCards", {}).get("cards", []) if isinstance(dcs, dict) else []
+    counts = [0] * 5
+    for c in dev_hand:
+        if c in (10, 11): counts[0] += 1      # knight
+        elif c == 12: counts[1] += 1           # year of plenty
+        elif c == 13: counts[2] += 1           # monopoly
+        elif c == 14: counts[3] += 1           # road building
+        elif c == 15: counts[4] += 1           # victory point
+    return counts
+
+
 def _build_action_mask(
     state: dict,
     parsed: dict,
@@ -573,15 +667,10 @@ def _build_action_mask(
     play_order: list[int],
     current_color: int,
 ) -> np.ndarray:
-    """Build an approximate action mask from the Colonist game state.
+    """Build a resource-aware action mask from the Colonist game state.
 
-    The mask doesn't need to be perfectly legal — it just needs to
-    reflect which ACTION TYPES are plausible so the model learns the
-    conditional distribution: "given these types of actions are available,
-    which does the human pick?"
-
-    We determine the game phase from the parsed action and state, then
-    enable the appropriate action type slots.
+    Only enables actions the player can actually afford, based on their
+    current resource cards and dev cards in hand.
     """
     mask = np.zeros(ACTION_SPACE, dtype=np.float32)
     act = parsed["action"]
@@ -591,44 +680,82 @@ def _build_action_mask(
     has_rolled = ds.get("diceThrown", False)
     is_setup = cs.get("completedTurns", 0) < 8
 
-    # The chosen action must always be legal
     mask[action_idx] = 1.0
 
     if is_setup:
-        # Setup phase: only settlements and roads
-        mask[5:59] = 1.0     # all settlement positions
-        mask[113:185] = 1.0  # all road positions
-    elif act in ("roll",):
-        # Pre-roll: can roll or play dev cards
-        mask[0] = 1.0        # roll
-        mask[3] = 1.0        # play knight
-        mask[4] = 1.0        # play road building
-    elif act in ("discard",):
-        # Discard phase
-        mask[280:285] = 1.0  # all 5 discard options
-    elif act in ("robber",):
-        # Robber placement
-        mask[185:280] = 1.0  # all robber positions
-    elif act == "end_turn":
-        # Post-roll: can build, trade, buy dev, or end turn
-        mask[1] = 1.0        # end turn
-        mask[2] = 1.0        # buy dev
-        mask[5:59] = 1.0     # settlements
-        mask[59:113] = 1.0   # cities
-        mask[113:185] = 1.0  # roads
-        mask[285:310] = 1.0  # yop, monopoly
-        mask[310:330] = 1.0  # maritime
-        mask[337:397] = 1.0  # trade offers
-    else:
-        # Any main-game action: enable all post-roll options
-        mask[1] = 1.0        # end turn
-        mask[2] = 1.0        # buy dev
-        mask[5:59] = 1.0     # settlements
-        mask[59:113] = 1.0   # cities
-        mask[113:185] = 1.0  # roads
-        mask[285:310] = 1.0  # yop, monopoly
-        mask[310:330] = 1.0  # maritime
-        mask[337:397] = 1.0  # trade offers
+        mask[5:59] = 1.0
+        mask[113:185] = 1.0
+        return mask
+
+    if act in ("roll",):
+        mask[0] = 1.0
+        dev = _get_player_dev_cards(state, current_color)
+        if dev[0] >= 1: mask[3] = 1.0   # knight
+        if dev[3] >= 1: mask[4] = 1.0   # road building
+        return mask
+
+    if act in ("discard",):
+        mask[280:285] = 1.0
+        return mask
+
+    if act in ("robber",):
+        mask[185:280] = 1.0
+        return mask
+
+    # Post-roll main phase: check resources for each action type
+    res = _get_player_resources(state, current_color)
+    wood, brick, sheep, wheat, ore = res
+
+    mask[1] = 1.0  # END_TURN always legal post-roll
+
+    # Settlement: 1 wood + 1 brick + 1 sheep + 1 wheat
+    if wood >= 1 and brick >= 1 and sheep >= 1 and wheat >= 1:
+        mask[5:59] = 1.0
+
+    # City: 3 ore + 2 wheat
+    if ore >= 3 and wheat >= 2:
+        mask[59:113] = 1.0
+
+    # Road: 1 wood + 1 brick
+    if wood >= 1 and brick >= 1:
+        mask[113:185] = 1.0
+
+    # Dev card: 1 ore + 1 sheep + 1 wheat
+    if ore >= 1 and sheep >= 1 and wheat >= 1:
+        mask[2] = 1.0
+
+    # Dev card plays (check hand)
+    dev = _get_player_dev_cards(state, current_color)
+    played_this_turn = cs.get("playedDevelopmentCardThisTurn", False)
+    if not played_this_turn:
+        if dev[0] >= 1: mask[3] = 1.0       # knight
+        if dev[3] >= 1: mask[4] = 1.0       # road building
+        if dev[1] >= 1: mask[285:305] = 1.0  # year of plenty
+        if dev[2] >= 1: mask[305:310] = 1.0  # monopoly
+
+    # Maritime trades: need >= 2 of give resource (with 2:1 port),
+    # >= 3 (with 3:1 generic port), or >= 4 (no port).
+    # Use bankTradeRatiosState if available, else fall back to 4:1.
+    ps_data = state.get("playerStates", {}).get(str(current_color), {})
+    trade_ratios = ps_data.get("bankTradeRatiosState", {}) if isinstance(ps_data, dict) else {}
+    # Colonist ratio keys: "1"=lumber, "2"=brick, "3"=wool, "4"=grain, "5"=ore
+    col_ratio_to_engine = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
+    engine_ratios = [4, 4, 4, 4, 4]
+    for rk, ratio in trade_ratios.items():
+        eng_idx = col_ratio_to_engine.get(rk)
+        if eng_idx is not None:
+            engine_ratios[eng_idx] = ratio
+    from hexzero.encoder.action_encoder import _MARITIME_PAIRS
+    for i, (give_res, _recv) in enumerate(_MARITIME_PAIRS):
+        if res[give_res] >= engine_ratios[give_res]:
+            mask[310 + i] = 1.0
+
+    # Trade offers: need resources to offer
+    for i in range(20):
+        give_res = i // 4
+        if res[give_res] >= 1: mask[337 + i] = 1.0  # 1:1
+        if res[give_res] >= 1: mask[357 + i] = 1.0  # 1:2
+        if res[give_res] >= 2: mask[377 + i] = 1.0  # 2:1
 
     return mask
 
@@ -692,10 +819,19 @@ def convert_single_game(
         return None
 
     color_to_seat = {c: i for i, c in enumerate(play_order)}
+
+    # Build VP-based reward: normalized final VP scores per seat
+    # This gives the value head richer gradient than binary win/loss
     reward_vec = np.zeros(4, dtype=np.float32)
-    if winner_color in color_to_seat:
-        reward_vec[color_to_seat[winner_color]] = 1.0
-    else:
+    end_players = end_state.get("players", {})
+    for color_str, pdata in end_players.items():
+        color = int(color_str)
+        seat = color_to_seat.get(color)
+        if seat is not None and isinstance(pdata, dict):
+            vps = pdata.get("victoryPoints", {})
+            total_vp = sum(int(v) for v in vps.values()) if isinstance(vps, dict) else 0
+            reward_vec[seat] = total_vp / 10.0  # normalize to [0, 1] range
+    if reward_vec.sum() < 0.1:
         return None
 
     state = copy.deepcopy(initial)
@@ -705,20 +841,43 @@ def convert_single_game(
     stats: dict[str, int] = {}
     steps: list[dict] = []
 
-    for evt in events:
+    for ei, evt in enumerate(events):
         sc = evt.get("stateChange", {})
         parsed_actions = _parse_event(evt)
+
+        # Infer steal victims for robber actions by looking at card
+        # changes in the NEXT event.
+        for parsed in parsed_actions:
+            if parsed["action"] == "robber" and ei + 1 < len(events):
+                next_sc = events[ei + 1].get("stateChange", {})
+                next_ps = next_sc.get("playerStates", {})
+                mover = parsed.get("player_color")
+                # Find who lost a card (victim) in the next event
+                card_counts_before = {}
+                for pid, pdata in state.get("playerStates", {}).items():
+                    card_counts_before[pid] = len(
+                        pdata.get("resourceCards", {}).get("cards", []))
+                tmp = copy.deepcopy(state)
+                _deep_merge(tmp, sc)
+                _deep_merge(tmp, next_sc)
+                for pid, pdata in tmp.get("playerStates", {}).items():
+                    after = len(pdata.get("resourceCards", {}).get("cards", []))
+                    before = card_counts_before.get(pid, 0)
+                    if after < before and str(pid) != str(mover):
+                        parsed["steal_victim_color"] = int(pid)
+                        break
 
         for parsed in parsed_actions:
             cs = state.get("currentState", {})
             current_color = cs.get("currentTurnPlayerColor") or play_order[0]
 
-            action_idx = _action_to_index(parsed, state, topo)
+            action_idx = _action_to_index(parsed, state, topo, play_order)
             if action_idx is None:
                 continue
 
             nf, ef, flat = _encode_state(
                 state, topo, current_color, play_order, production, port_oh,
+                action_name=parsed["action"],
             )
 
             act_name = parsed["action"]
@@ -793,11 +952,12 @@ def _worker_fn(
     games_per_shard: int,
     counter,
     total_files: int,
+    shard_idx_start: int = 0,
 ) -> None:
     topo = _precompute_topology()
 
     shard_steps: list[dict] = []
-    shard_idx = 0
+    shard_idx = shard_idx_start
     total_steps = 0
     converted = 0
     skipped = 0
@@ -855,9 +1015,10 @@ def _worker_fn(
         shard_idx += 1
 
     elapsed = time.time() - t_start
+    shards_written = shard_idx - shard_idx_start
     print(f"[worker {worker_id}] Done: {len(file_list)} files, "
           f"{converted} converted, {skipped} skipped, {errors} errors, "
-          f"{total_steps:,} steps, {shard_idx} shards in {elapsed:.1f}s",
+          f"{total_steps:,} steps, {shards_written} shards in {elapsed:.1f}s",
           flush=True)
     if worker_id == 0:
         print(f"  Action breakdown: {dict(sorted(all_stats.items(), key=lambda x: -x[1]))}")
@@ -880,6 +1041,19 @@ def main():
     if args.num_workers <= 0:
         args.num_workers = max(1, os.cpu_count() - 2)
 
+    # Per-worker max shard index so resumed runs don't overwrite old shards
+    worker_max_shard: dict[int, int] = {}
+    for f in os.listdir(args.output_dir):
+        if f.endswith(".pt"):
+            stem = f.removesuffix(".pt")
+            if "_" in stem and stem.startswith("w"):
+                try:
+                    wid = int(stem.split("_")[0][1:])
+                    fid = int(stem.split("_")[1])
+                    worker_max_shard[wid] = max(worker_max_shard.get(wid, -1), fid)
+                except ValueError:
+                    pass
+
     json_files = sorted(str(p) for p in Path(args.input_dir).glob("*.json"))
     if args.max_games > 0:
         json_files = json_files[:args.max_games]
@@ -893,8 +1067,9 @@ def main():
     t0 = time.time()
 
     if args.num_workers <= 1:
+        fstart = worker_max_shard.get(0, -1) + 1
         _worker_fn(0, json_files, args.output_dir, args.games_per_shard,
-                    None, len(json_files))
+                    None, len(json_files), shard_idx_start=fstart)
     else:
         ctx = mp.get_context("spawn")
         counter = ctx.Value("i", 0)
@@ -906,10 +1081,11 @@ def main():
             chunk = json_files[start:end]
             if not chunk:
                 continue
+            fstart = worker_max_shard.get(w, -1) + 1
             p = ctx.Process(
                 target=_worker_fn,
                 args=(w, chunk, args.output_dir, args.games_per_shard,
-                      counter, len(json_files)),
+                      counter, len(json_files), fstart),
                 daemon=True,
             )
             p.start()
@@ -919,39 +1095,18 @@ def main():
 
     elapsed = time.time() - t0
 
-    pt_files = sorted(f for f in os.listdir(args.output_dir) if f.endswith(".pt"))
-    total_steps = 0
-    action_counts: dict[int, int] = {}
-    for f in pt_files:
-        d = torch.load(os.path.join(args.output_dir, f), weights_only=False)
-        acts = d["action_idx"].numpy()
-        total_steps += len(acts)
-        for a in acts:
-            action_counts[int(a)] = action_counts.get(int(a), 0) + 1
-
-    from human_bot.evaluate import action_type_label
-    type_counts: dict[str, int] = {}
-    for aidx, cnt in action_counts.items():
-        label = action_type_label(aidx)
-        type_counts[label] = type_counts.get(label, 0) + cnt
+    pt_files = [f for f in os.listdir(args.output_dir) if f.endswith(".pt")]
+    disk_mb = sum(
+        os.path.getsize(os.path.join(args.output_dir, f))
+        for f in pt_files
+    ) / (1024 * 1024)
 
     print(f"\n{'=' * 65}")
     print(f"Conversion complete")
     print(f"  Input files:     {len(json_files):,}")
-    print(f"  Total steps:     {total_steps:,}")
-    print(f"  Avg steps/game:  {total_steps / max(len(json_files), 1):.1f}")
     print(f"  Shards:          {len(pt_files)}")
+    print(f"  Disk usage:      {disk_mb:.1f} MB")
     print(f"  Wall time:       {elapsed:.1f}s")
-    print(f"\n  Action type distribution:")
-    for label, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
-        print(f"    {label:<14s}  {cnt:>10,}  ({cnt / max(total_steps, 1) * 100:.1f}%)")
-    unique_corners = len(set(a for a in action_counts if 5 <= a < 113))
-    unique_edges = len(set(a for a in action_counts if 113 <= a < 185))
-    unique_robber = len(set(a for a in action_counts if 185 <= a < 280))
-    print(f"\n  Spatial differentiation:")
-    print(f"    Unique settlement/city positions: {unique_corners}")
-    print(f"    Unique road positions:            {unique_edges}")
-    print(f"    Unique robber positions:           {unique_robber}")
     print(f"{'=' * 65}")
 
 

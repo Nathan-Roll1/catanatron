@@ -171,9 +171,13 @@ class State:
         state_copy.resource_freqdeck = self.resource_freqdeck.copy()
         state_copy.development_listdeck = self.development_listdeck.copy()
 
-        state_copy.buildings_by_color = pickle.loads(
-            pickle.dumps(self.buildings_by_color)
-        )
+        bbc = {}
+        for color, blds in self.buildings_by_color.items():
+            d = defaultdict(list)
+            for k, v in blds.items():
+                d[k] = list(v)
+            bbc[color] = d
+        state_copy.buildings_by_color = bbc
         state_copy.action_records = self.action_records.copy()
         state_copy.num_turns = self.num_turns
 

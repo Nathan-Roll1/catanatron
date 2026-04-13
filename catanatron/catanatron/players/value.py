@@ -1,34 +1,23 @@
 import random
 
-from catanatron.state_functions import (
-    get_longest_road_length,
-    get_played_dev_cards,
-    player_key,
-    player_num_dev_cards,
-    player_num_resource_cards,
-)
 from catanatron.models.player import Player
+from catanatron.models.map import DICE_PROBAS
 from catanatron.models.enums import RESOURCES, SETTLEMENT, CITY
-from catanatron.features import (
-    build_production_features,
-    reachability_features,
-    resource_hand_features,
-)
 
-TRANSLATE_VARIETY = 4  # i.e. each new resource is like 4 production points
+TRANSLATE_VARIETY = 4
+_PROBA_POINT = 2.778 / 100
+_VARIETY_BONUS = TRANSLATE_VARIETY * _PROBA_POINT
+_DICE = DICE_PROBAS
 
 DEFAULT_WEIGHTS = {
-    # Where to place. Note winning is best at all costs
     "public_vps": 3e14,
     "production": 1e8,
     "enemy_production": -1e8,
     "num_tiles": 1,
-    # Towards where to expand and when
     "reachable_production_0": 0,
     "reachable_production_1": 1e4,
     "buildable_nodes": 1e3,
     "longest_road": 10,
-    # Hand, when to hold and when to use.
     "hand_synergy": 1e2,
     "hand_resources": 1,
     "discard_penalty": -5,
@@ -36,7 +25,6 @@ DEFAULT_WEIGHTS = {
     "army_size": 10.1,
 }
 
-# Change these to play around with new values
 CONTENDER_WEIGHTS = {
     "public_vps": 300000000000001.94,
     "production": 100000002.04188395,
@@ -54,75 +42,112 @@ CONTENDER_WEIGHTS = {
 }
 
 
+def _compute_production(state, board, color, robber_coordinate):
+    """Compute total production + variety for a single color. No dicts."""
+    settlements = state.buildings_by_color[color].get(SETTLEMENT, ())
+    cities = state.buildings_by_color[color].get(CITY, ())
+    adj = board.map.adjacent_tiles
+    robber_tile = board.map.tiles.get(robber_coordinate)
+    dice = _DICE
+    total = 0.0
+    variety = 0
+    for resource in RESOURCES:
+        res_prod = 0.0
+        for node_id in settlements:
+            for t in adj[node_id]:
+                if t.resource is resource and t is not robber_tile and t.number is not None:
+                    res_prod += dice[t.number]
+        for node_id in cities:
+            for t in adj[node_id]:
+                if t.resource is resource and t is not robber_tile and t.number is not None:
+                    res_prod += dice[t.number] + dice[t.number]
+        total += res_prod
+        if res_prod != 0.0:
+            variety += 1
+    return total, variety
+
+
 def base_fn(params=DEFAULT_WEIGHTS):
+    w_vps = params["public_vps"]
+    w_prod = params["production"]
+    w_eprod = params["enemy_production"]
+    w_tiles = params["num_tiles"]
+    w_reach0 = params["reachable_production_0"]
+    w_reach1 = params["reachable_production_1"]
+    w_buildable = params["buildable_nodes"]
+    w_road = params["longest_road"]
+    w_synergy = params["hand_synergy"]
+    w_hand = params["hand_resources"]
+    w_discard = params["discard_penalty"]
+    w_devs = params["hand_devs"]
+    w_army = params["army_size"]
+
     def fn(game, p0_color):
-        production_features = build_production_features(True)
-        our_production_sample = production_features(game, p0_color)
-        enemy_production_sample = production_features(game, p0_color)
-        production = value_production(our_production_sample, "P0")
-        enemy_production = value_production(enemy_production_sample, "P1", False)
+        state = game.state
+        board = state.board
+        ps = state.player_state
+        robber = board.robber_coordinate
+        colors = state.colors
+        p0_idx = state.color_to_index[p0_color]
+        key = f"P{p0_idx}"
 
-        key = player_key(game.state, p0_color)
-        longest_road_length = get_longest_road_length(game.state, p0_color)
+        p0_prod, p0_var = _compute_production(state, board, p0_color, robber)
+        production = p0_prod + p0_var * _VARIETY_BONUS
 
-        reachability_sample = reachability_features(game, p0_color, 2)
-        features = [f"P0_0_ROAD_REACHABLE_{resource}" for resource in RESOURCES]
-        reachable_production_at_zero = sum([reachability_sample[f] for f in features])
-        features = [f"P0_1_ROAD_REACHABLE_{resource}" for resource in RESOURCES]
-        reachable_production_at_one = sum([reachability_sample[f] for f in features])
+        enemy_color = colors[1] if colors[0] == p0_color else colors[0]
+        e_prod, _ = _compute_production(state, board, enemy_color, robber)
+        enemy_production = e_prod
 
-        hand_sample = resource_hand_features(game, p0_color)
-        features = [f"P0_{resource}_IN_HAND" for resource in RESOURCES]
-        distance_to_city = (
-            max(2 - hand_sample["P0_WHEAT_IN_HAND"], 0)
-            + max(3 - hand_sample["P0_ORE_IN_HAND"], 0)
-        ) / 5.0  # 0 means good. 1 means bad.
-        distance_to_settlement = (
-            max(1 - hand_sample["P0_WHEAT_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_SHEEP_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_BRICK_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_WOOD_IN_HAND"], 0)
-        ) / 4.0  # 0 means good. 1 means bad.
-        hand_synergy = (2 - distance_to_city - distance_to_settlement) / 2
+        longest_road_length = ps[f"{key}_LONGEST_ROAD_LENGTH"]
 
-        num_in_hand = player_num_resource_cards(game.state, p0_color)
-        discard_penalty = params["discard_penalty"] if num_in_hand > 7 else 0
+        wheat = ps[f"{key}_WHEAT_IN_HAND"]
+        ore = ps[f"{key}_ORE_IN_HAND"]
+        sheep = ps[f"{key}_SHEEP_IN_HAND"]
+        brick = ps[f"{key}_BRICK_IN_HAND"]
+        wood = ps[f"{key}_WOOD_IN_HAND"]
 
-        # blockability
-        buildings = game.state.buildings_by_color[p0_color]
+        d_city = (max(2 - wheat, 0) + max(3 - ore, 0)) / 5.0
+        d_settle = (max(1-wheat,0) + max(1-sheep,0) + max(1-brick,0) + max(1-wood,0)) / 4.0
+        hand_synergy = (2 - d_city - d_settle) / 2
+
+        num_in_hand = wood + brick + sheep + wheat + ore
+
+        buildings = state.buildings_by_color[p0_color]
         owned_nodes = buildings[SETTLEMENT] + buildings[CITY]
         owned_tiles = set()
         for n in owned_nodes:
-            owned_tiles.update(game.state.board.map.adjacent_tiles[n])
-        num_tiles = len(owned_tiles)
+            owned_tiles.update(board.map.adjacent_tiles[n])
 
-        # TODO: Simplify to linear(?)
-        num_buildable_nodes = len(game.state.board.buildable_node_ids(p0_color))
-        longest_road_factor = (
-            params["longest_road"] if num_buildable_nodes == 0 else 0.1
+        num_buildable_nodes = len(board.buildable_node_ids(p0_color))
+        longest_road_factor = w_road if num_buildable_nodes == 0 else 0.1
+
+        num_devs = (
+            ps[f"{key}_KNIGHT_IN_HAND"]
+            + ps[f"{key}_YEAR_OF_PLENTY_IN_HAND"]
+            + ps[f"{key}_ROAD_BUILDING_IN_HAND"]
+            + ps[f"{key}_MONOPOLY_IN_HAND"]
+            + ps[f"{key}_VICTORY_POINT_IN_HAND"]
         )
+        army = ps[f"{key}_PLAYED_KNIGHT"]
 
         return float(
-            game.state.player_state[f"{key}_VICTORY_POINTS"] * params["public_vps"]
-            + production * params["production"]
-            + enemy_production * params["enemy_production"]
-            + reachable_production_at_zero * params["reachable_production_0"]
-            + reachable_production_at_one * params["reachable_production_1"]
-            + hand_synergy * params["hand_synergy"]
-            + num_buildable_nodes * params["buildable_nodes"]
-            + num_tiles * params["num_tiles"]
-            + num_in_hand * params["hand_resources"]
-            + discard_penalty
+            ps[f"{key}_VICTORY_POINTS"] * w_vps
+            + production * w_prod
+            + enemy_production * w_eprod
+            + hand_synergy * w_synergy
+            + num_buildable_nodes * w_buildable
+            + len(owned_tiles) * w_tiles
+            + num_in_hand * w_hand
+            + (w_discard if num_in_hand > 7 else 0)
             + longest_road_length * longest_road_factor
-            + player_num_dev_cards(game.state, p0_color) * params["hand_devs"]
-            + get_played_dev_cards(game.state, p0_color, "KNIGHT") * params["army_size"]
+            + num_devs * w_devs
+            + army * w_army
         )
 
     return fn
 
 
 def value_production(sample, player_name="P0", include_variety=True):
-    proba_point = 2.778 / 100
     features = [
         f"EFFECTIVE_{player_name}_WHEAT_PRODUCTION",
         f"EFFECTIVE_{player_name}_ORE_PRODUCTION",
@@ -130,11 +155,9 @@ def value_production(sample, player_name="P0", include_variety=True):
         f"EFFECTIVE_{player_name}_WOOD_PRODUCTION",
         f"EFFECTIVE_{player_name}_BRICK_PRODUCTION",
     ]
-    prod_sum = sum([sample[f] for f in features])
-    prod_variety = (
-        sum([sample[f] != 0 for f in features]) * TRANSLATE_VARIETY * proba_point
-    )
-    return prod_sum + (0 if not include_variety else prod_variety)
+    prod_sum = sum(sample[f] for f in features)
+    prod_variety = sum(1 for f in features if sample[f] != 0) * _VARIETY_BONUS
+    return prod_sum + (prod_variety if include_variety else 0)
 
 
 def contender_fn(params):
@@ -165,13 +188,12 @@ class ValueFunctionPlayer(Player):
         if self.epsilon is not None and random.random() < self.epsilon:
             return random.choice(playable_actions)
 
+        value_fn = get_value_fn(self.value_fn_builder_name, self.params)
         best_value = float("-inf")
         best_action = None
         for action in playable_actions:
             game_copy = game.copy()
             game_copy.execute(action)
-
-            value_fn = get_value_fn(self.value_fn_builder_name, self.params)
             value = value_fn(game_copy, self.color)
             if value > best_value:
                 best_value = value
@@ -183,11 +205,16 @@ class ValueFunctionPlayer(Player):
         return super().__str__() + f"(value_fn={self.value_fn_builder_name})"
 
 
+_BASE_FN_CACHE = {}
+
+
 def get_value_fn(name, params, value_function=None):
     if value_function is not None:
         return value_function
     elif name == "base_fn":
-        return base_fn(DEFAULT_WEIGHTS)
+        if "base" not in _BASE_FN_CACHE:
+            _BASE_FN_CACHE["base"] = base_fn(DEFAULT_WEIGHTS)
+        return _BASE_FN_CACHE["base"]
     elif name == "contender_fn":
         return contender_fn(params)
     else:

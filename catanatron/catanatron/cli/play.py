@@ -16,8 +16,6 @@ from catanatron.models.player import Color
 from catanatron.models.map import NumberPlacement, build_map
 from catanatron.state_functions import get_actual_victory_points
 
-# try to suppress TF output before any potentially tf-importing modules
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from catanatron.utils import ensure_dir, format_secs
 from catanatron.cli.cli_players import (
     CUSTOM_ACCUMULATORS,
@@ -74,40 +72,7 @@ class CustomTimeRemainingColumn(TimeRemainingColumn):
     "-o",
     "--output",
     default=None,
-    help="Directory where to save game data.",
-)
-@click.option(
-    "--output-format",
-    default=None,
-    type=click.Choice(["csv", "parquet", "json"], case_sensitive=False),
-    help="Format to save game data: csv, parquet, or json.",
-)
-@click.option(
-    "--include-board-tensor",
-    default=False,
-    is_flag=True,
-    help="Wether to generate 3D Tensor of the Board for CNN Learning (slower) when using --csv or --parquet.",
-)
-@click.option(
-    "--db",
-    default=False,
-    is_flag=True,
-    help="""
-        Save game in PGSQL database.
-        Expects docker-compose provided database to be up and running.
-        This allows games to be watched.
-        """,
-)
-@click.option(
-    "--step-db",
-    default=False,
-    is_flag=True,
-    help="""
-        Save the entire game in PGSQL database.
-        Expects docker-compose provided database to be up and running.
-        This allows games to be replayed.
-        WARNING: this reduces the simulation speed down to 1 game per minute.
-        """,
+    help="Directory where to save game data (JSON format).",
 )
 @click.option(
     "--config-discard-limit",
@@ -155,10 +120,6 @@ def simulate(
     players,
     code,
     output,
-    output_format,
-    include_board_tensor,
-    db,
-    step_db,
     config_discard_limit,
     config_vps_to_win,
     config_map,
@@ -174,9 +135,8 @@ def simulate(
 
     Examples:\n\n
         catanatron-play --players R,R,R,R --num 1000\n
-        catanatron-play --players W,W,R,R --num 50000 --output data/ --output-format csv\n
-        catanatron-play --players VP,F --num 10 --output data/ --ouput-format json\n
-        catanatron-play --players W,F,AB:3 --num 1 --ouput-format csv --db --quiet
+        catanatron-play --players W,F,AB:2 --num 500 --quiet\n
+        catanatron-play --players VP,F --num 10 --output data/
     """
     if code:
         abspath = os.path.abspath(code)
@@ -187,13 +147,9 @@ def simulate(
 
     if help_players:
         return Console().print(player_help_table())
-    if output and not output_format:
-        return print("--output requires --output-format")
 
     players = parse_cli_string(players)
-    output_options = OutputOptions(
-        output, output_format, include_board_tensor, db, step_db
-    )
+    output_options = OutputOptions(output)
     game_config = GameConfigOptions(
         config_discard_limit,
         config_vps_to_win,
@@ -212,13 +168,7 @@ def simulate(
 
 @dataclass(frozen=True)
 class OutputOptions:
-    """Class to keep track of output CLI flags"""
-
-    output: Union[str, None] = None  # path to store files
-    output_format: Union[Literal["csv", "parquet", "json"], None] = None
-    include_board_tensor: bool = False
-    db: bool = False
-    step_db: bool = False
+    output: Union[str, None] = None
 
 
 @dataclass(frozen=True)
@@ -295,43 +245,7 @@ def play_batch(
     accumulators = [statistics_accumulator, vp_accumulator]
     if output_options.output:
         ensure_dir(output_options.output)
-    if output_options.output:
-        if output_options.output_format == "csv":
-            # lazy load CsvDataAccumulator since depends on pandas / numpy
-            from catanatron.gym.accumulators import CsvDataAccumulator
-
-            accumulators.append(
-                CsvDataAccumulator(
-                    tuple(p.color for p in players),
-                    game_config.map_type,
-                    output_options.output,
-                    output_options.include_board_tensor,
-                )
-            )
-        elif output_options.output_format == "parquet":
-            # lazy load ParquetDataAccumulator since depends on pandas / pyarrow
-            from catanatron.gym.accumulators import ParquetDataAccumulator
-
-            accumulators.append(
-                ParquetDataAccumulator(
-                    tuple(p.color for p in players),
-                    game_config.map_type,
-                    output_options.output,
-                    output_options.include_board_tensor,
-                )
-            )
-        elif output_options.output_format == "json":
-            accumulators.append(JsonDataAccumulator(output_options.output))
-    if output_options.db:
-        # lazy load DatabaseAccumulator since depends on sqlalchemy
-        from catanatron.web.database_accumulator import DatabaseAccumulator
-
-        accumulators.append(DatabaseAccumulator())
-    if output_options.step_db:
-        # lazy load DatabaseAccumulator since depends on sqlalchemy
-        from catanatron.web.database_accumulator import StepDatabaseAccumulator
-
-        accumulators.append(StepDatabaseAccumulator())
+        accumulators.append(JsonDataAccumulator(output_options.output))
     for accumulator_class in CUSTOM_ACCUMULATORS:
         accumulators.append(accumulator_class(players=players, game_config=game_config))
 
@@ -354,10 +268,6 @@ def play_batch(
     for player in players:
         table.add_column(f"{player.color.value} VP", justify="right")
     table.add_column("WINNER")
-    if output_options.db:
-        table.add_column("LINK", overflow="fold")
-    if output_options.step_db:
-        table.add_column("REPLAY LINK", overflow="fold")
 
     with Progress(
         "[progress.description]{task.description}",
@@ -390,35 +300,6 @@ def play_batch(
                     points = get_actual_victory_points(game.state, player.color)
                     row.append(str(points))
                 row.append(rich_color(winning_color))
-
-                if output_options.db:
-                    from catanatron.web.database_accumulator import DatabaseAccumulator
-
-                    database_accumulator = next(
-                        (
-                            accumulator
-                            for accumulator in accumulators
-                            if isinstance(accumulator, DatabaseAccumulator)
-                        ),
-                        None,
-                    )
-                    row.append(database_accumulator.link)
-
-                if output_options.step_db:
-                    from catanatron.web.database_accumulator import (
-                        StepDatabaseAccumulator,
-                    )
-
-                    step_database_accumulator = next(
-                        (
-                            accumulator
-                            for accumulator in accumulators
-                            if isinstance(accumulator, StepDatabaseAccumulator)
-                        ),
-                        None,
-                    )
-                    row.append(step_database_accumulator.link)
-
                 table.add_row(*row)
 
             progress.update(main_task, advance=1)

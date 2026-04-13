@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Catanatron Evo Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d1117; color: #c9d1d9; font-family: 'SF Mono', 'Menlo', monospace; font-size: 13px; }
+.header { padding: 12px 20px; border-bottom: 1px solid #21262d; display: flex; justify-content: space-between; align-items: center; }
+.header h1 { font-size: 16px; font-weight: 600; color: #58a6ff; }
+.stats { display: flex; gap: 24px; }
+.stat { text-align: center; }
+.stat .val { font-size: 20px; font-weight: 700; color: #f0f6fc; }
+.stat .lbl { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; height: calc(100vh - 52px); }
+.panel { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 12px; overflow: hidden; }
+.panel h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+canvas { width: 100%; height: calc(100% - 28px); }
+#familyTree { overflow-y: auto; font-size: 11px; }
+#familyTree .node { padding: 2px 6px; margin: 1px 0; border-radius: 3px; display: inline-block; }
+.alive { opacity: 1; } .dead { opacity: 0.35; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Catanatron Evolutionary Optimizer</h1>
+    <div class="stats">
+        <div class="stat"><div class="val" id="sGen">0</div><div class="lbl">Generation</div></div>
+        <div class="stat"><div class="val" id="sGames">0</div><div class="lbl">Games</div></div>
+        <div class="stat"><div class="val" id="sGps">0</div><div class="lbl">Games/sec</div></div>
+        <div class="stat"><div class="val" id="sBest">25.0%</div><div class="lbl">Best WR</div></div>
+        <div class="stat"><div class="val" id="sVal">--</div><div class="lbl">Val vs Base</div></div>
+        <div class="stat"><div class="val" id="sTime">0:00</div><div class="lbl">Elapsed</div></div>
+    </div>
+</div>
+<div class="grid">
+    <div class="panel"><h2>Win Rate by Variant (over generations)</h2><canvas id="wrChart"></canvas></div>
+    <div class="panel"><h2>Champion Parameter Drift from Baseline</h2><canvas id="driftChart"></canvas></div>
+    <div class="panel"><h2>Validation WR vs Baseline (green=val, blue=train avg)</h2><canvas id="histChart"></canvas></div>
+    <div class="panel" id="familyPanel"><h2>Population &amp; Lineage</h2><div id="familyTree"></div></div>
+</div>
+<script>
+const COLORS = ['#ff7b72','#79c0ff','#7ee787','#d2a8ff','#ffa657','#ff9bce','#a5d6ff','#f0e68c'];
+const WNAMES = ['vps','prod','eprod','tiles','buildable','road','synergy','hand','discard','devs','army'];
+const ORIG = [3e14,1e8,-1e8,1,1e3,10,1e2,1,-5,10,10.1];
+let history = [];
+let lastLen = 0;
+
+function fetchData() {
+    fetch('/data?' + Date.now()).then(r => r.text()).then(text => {
+        const lines = text.trim().split('\n').filter(l => l.length > 0);
+        if (lines.length <= lastLen) return;
+        lastLen = lines.length;
+        history = lines.map(l => { try { return JSON.parse(l); } catch(e) { return null; } }).filter(x => x);
+        if (history.length > 0) render();
+    }).catch(() => {});
+}
+
+function render() {
+    const latest = history[history.length - 1];
+    document.getElementById('sGen').textContent = latest.gen;
+    document.getElementById('sGames').textContent = (latest.total_games/1000).toFixed(0) + 'k';
+    document.getElementById('sGps').textContent = latest.gps.toFixed(0);
+    const m = Math.floor(latest.elapsed/60), s = Math.floor(latest.elapsed%60);
+    document.getElementById('sTime').textContent = m + ':' + (s<10?'0':'') + s;
+
+    let bestWr = 0;
+    for (const v of latest.variants) if (v.wr > bestWr) bestWr = v.wr;
+    document.getElementById('sBest').textContent = bestWr.toFixed(1) + '%';
+    if (latest.val_wr >= 0) {
+        const valEl = document.getElementById('sVal');
+        valEl.textContent = latest.val_wr.toFixed(1) + '%';
+        valEl.style.color = latest.val_wr > 26 ? '#7ee787' : (latest.val_wr < 24 ? '#ff7b72' : '#c9d1d9');
+    }
+
+    drawWrChart();
+    drawDriftChart(latest);
+    drawHistChart();
+    drawFamily(latest);
+}
+
+function setupCanvas(id) {
+    const c = document.getElementById(id);
+    const rect = c.parentElement.getBoundingClientRect();
+    const w = rect.width - 24, h = rect.height - 40;
+    c.width = w * 2; c.height = h * 2;
+    c.style.width = w + 'px'; c.style.height = h + 'px';
+    const ctx = c.getContext('2d');
+    ctx.scale(2, 2);
+    return { ctx, w, h };
+}
+
+function drawWrChart() {
+    const { ctx, w, h } = setupCanvas('wrChart');
+    ctx.clearRect(0, 0, w, h);
+    if (history.length < 2) return;
+
+    const margin = { l: 40, r: 10, t: 10, b: 20 };
+    const pw = w - margin.l - margin.r, ph = h - margin.t - margin.b;
+
+    ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+    for (let y = 15; y <= 35; y += 5) {
+        const py = margin.t + ph - (y - 15) / 20 * ph;
+        ctx.beginPath(); ctx.moveTo(margin.l, py); ctx.lineTo(w - margin.r, py); ctx.stroke();
+        ctx.fillStyle = '#484f58'; ctx.font = '9px monospace';
+        ctx.fillText(y + '%', 4, py + 3);
+    }
+
+    // 25% baseline
+    const bl = margin.t + ph - (25 - 15) / 20 * ph;
+    ctx.strokeStyle = '#f85149'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(margin.l, bl); ctx.lineTo(w - margin.r, bl); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const n = Math.min(history.length, 200);
+    const start = history.length - n;
+    const step = pw / Math.max(n - 1, 1);
+
+    // Track unique variant IDs
+    const ids = new Set();
+    for (let i = start; i < history.length; i++)
+        for (const v of history[i].variants) ids.add(v.id);
+    const idList = [...ids].sort((a,b) => a-b);
+
+    for (const vid of idList) {
+        ctx.strokeStyle = COLORS[vid % COLORS.length];
+        ctx.lineWidth = 1.5; ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < n; i++) {
+            const d = history[start + i];
+            const v = d.variants.find(x => x.id === vid);
+            if (!v) continue;
+            const x = margin.l + i * step;
+            const y = margin.t + ph - (Math.max(15, Math.min(35, v.wr)) - 15) / 20 * ph;
+            if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawDriftChart(latest) {
+    const { ctx, w, h } = setupCanvas('driftChart');
+    ctx.clearRect(0, 0, w, h);
+
+    let bestIdx = 0, bestWr = 0;
+    for (let i = 0; i < latest.variants.length; i++)
+        if (latest.variants[i].wr > bestWr) { bestWr = latest.variants[i].wr; bestIdx = i; }
+    const champ = latest.variants[bestIdx];
+
+    const margin = { l: 70, r: 10, t: 10, b: 20 };
+    const pw = w - margin.l - margin.r, ph = h - margin.t - margin.b;
+    const barH = ph / NUM_W - 2;
+
+    for (let i = 0; i < NUM_W; i++) {
+        const pct = (champ.w[i] - ORIG[i]) / Math.abs(ORIG[i]) * 100;
+        const y = margin.t + i * (ph / NUM_W);
+        const maxPct = 20;
+        const bw = Math.min(Math.abs(pct), maxPct) / maxPct * (pw / 2);
+        const cx = margin.l + pw / 2;
+
+        ctx.fillStyle = pct >= 0 ? '#7ee787' : '#ff7b72';
+        ctx.globalAlpha = 0.7;
+        if (pct >= 0) ctx.fillRect(cx, y, bw, barH);
+        else ctx.fillRect(cx - bw, y, bw, barH);
+        ctx.globalAlpha = 1;
+
+        ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+        ctx.fillText(WNAMES[i], margin.l - 4, y + barH / 2 + 4);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#c9d1d9'; ctx.font = '9px monospace';
+        const tx = pct >= 0 ? cx + bw + 4 : cx - bw - 30;
+        ctx.fillText(pct.toFixed(1) + '%', tx, y + barH / 2 + 3);
+    }
+
+    // Zero line
+    const cx = margin.l + pw / 2;
+    ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, margin.t); ctx.lineTo(cx, h - margin.b); ctx.stroke();
+}
+
+const NUM_W = 11;
+const WINDOW = 20;
+
+function drawHistChart() {
+    const { ctx, w, h } = setupCanvas('histChart');
+    ctx.clearRect(0, 0, w, h);
+    if (history.length < WINDOW + 1) return;
+
+    const margin = { l: 40, r: 10, t: 10, b: 20 };
+    const pw = w - margin.l - margin.r, ph = h - margin.t - margin.b;
+
+    // Compute moving average of best variant's WR
+    const avg = [];
+    for (let i = WINDOW; i < history.length; i++) {
+        let sum = 0;
+        for (let j = i - WINDOW; j < i; j++) {
+            let best = 0;
+            for (const v of history[j].variants) if (v.wr > best) best = v.wr;
+            sum += best;
+        }
+        avg.push(sum / WINDOW);
+    }
+
+    const minY = 20, maxY = 35;
+    ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+    for (let y = minY; y <= maxY; y += 5) {
+        const py = margin.t + ph - (y - minY) / (maxY - minY) * ph;
+        ctx.beginPath(); ctx.moveTo(margin.l, py); ctx.lineTo(w - margin.r, py); ctx.stroke();
+        ctx.fillStyle = '#484f58'; ctx.font = '9px monospace'; ctx.fillText(y + '%', 4, py + 3);
+    }
+
+    const bl = margin.t + ph - (25 - minY) / (maxY - minY) * ph;
+    ctx.strokeStyle = '#f85149'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(margin.l, bl); ctx.lineTo(w - margin.r, bl); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const step = pw / Math.max(avg.length - 1, 1);
+    ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < avg.length; i++) {
+        const x = margin.l + i * step;
+        const y = margin.t + ph - (Math.max(minY, Math.min(maxY, avg[i])) - minY) / (maxY - minY) * ph;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    /* Overlay validation WR as green line */
+    const vStep = pw / Math.max(history.length - 1, 1);
+    ctx.strokeStyle = '#7ee787'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    let vStarted = false;
+    for (let i = 0; i < history.length; i++) {
+        const vwr = history[i].val_wr;
+        if (vwr < 0) continue;
+        const x = margin.l + i * vStep;
+        const y = margin.t + ph - (Math.max(minY, Math.min(maxY, vwr)) - minY) / (maxY - minY) * ph;
+        if (!vStarted) { ctx.moveTo(x, y); vStarted = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+}
+
+function drawFamily(latest) {
+    const div = document.getElementById('familyTree');
+    let html = '<div style="line-height:1.8">';
+
+    const sorted = [...latest.variants].sort((a, b) => b.wr - a.wr);
+    for (let i = 0; i < sorted.length; i++) {
+        const v = sorted[i];
+        const col = COLORS[v.id % COLORS.length];
+        const medal = i === 0 ? ' ★' : '';
+        html += `<div class="node alive" style="background:${col}22;border:1px solid ${col}">`;
+        html += `<b style="color:${col}">V${v.id}</b>${medal} `;
+        html += `WR: <b>${v.wr.toFixed(1)}%</b> `;
+        html += `(${v.wins}/${v.seats}) `;
+        html += `parent: ${v.parent >= 0 ? 'V' + v.parent : 'root'} `;
+        html += `born: gen ${v.born}`;
+
+        // Show top parameter drifts
+        const drifts = [];
+        for (let j = 0; j < NUM_W; j++) {
+            const pct = (v.w[j] - ORIG[j]) / Math.abs(ORIG[j]) * 100;
+            if (Math.abs(pct) > 0.3) drifts.push(WNAMES[j] + (pct > 0 ? '+' : '') + pct.toFixed(1) + '%');
+        }
+        if (drifts.length > 0) html += `<br><span style="color:#8b949e;font-size:10px">${drifts.join(', ')}</span>`;
+        html += '</div><br>';
+    }
+    html += '</div>';
+    div.innerHTML = html;
+}
+
+setInterval(fetchData, 1000);
+fetchData();
+</script>
+</body>
+</html>

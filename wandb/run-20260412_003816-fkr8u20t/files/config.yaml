@@ -1,0 +1,65 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            7pnjb4apw3qfgvn0pc35fysi0mqxsmqx:
+                apple: {}
+                args:
+                    - --ab2-dir
+                    - data/ab2_v2_fixed
+                    - --human-dir
+                    - data/human_v2_fixed
+                    - --ckpt-dir
+                    - checkpoints/v2
+                    - --batch-size
+                    - "8192"
+                    - --shards-per-group
+                    - "20"
+                    - --eval-games
+                    - "0"
+                codePath: human_bot/cluster_train_inner.py
+                codePathLocal: human_bot/cluster_train_inner.py
+                cpu_count: 18
+                cpu_count_logical: 18
+                disk:
+                    /:
+                        total: "1995165736960"
+                        used: "946697355264"
+                email: nathanroll12@gmail.com
+                executable: /Library/Developer/CommandLineTools/usr/bin/python3
+                git:
+                    commit: de940ad9e1f08ed300a49c76a904a7ce5e20c1f4
+                    remote: https://github.com/Nathan-Roll1/catanatron.git
+                host: Nathans-MacBook-Pro.local
+                memory:
+                    total: "137438953472"
+                os: macOS-26.3-arm64-arm-64bit
+                program: /Users/nathanroll/Documents/catanatron/human_bot/cluster_train_inner.py
+                python: CPython 3.9.6
+                root: /Users/nathanroll/Documents/catanatron
+                startedAt: "2026-04-12T07:38:16.995678Z"
+                writerId: 7pnjb4apw3qfgvn0pc35fysi0mqxsmqx
+        m: []
+        python_version: 3.9.6
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+            "4": 3.9.6
+            "5": 0.25.1
+            "12": 0.25.1
+            "13": darwin-arm64
+batch_size:
+    value: 8192
+device:
+    value: mps
+params:
+    value: 602253
+seed:
+    value: 42
+shards_per_group:
+    value: 20

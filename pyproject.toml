@@ -19,33 +19,13 @@ classifiers = [
 dependencies = ["networkx", "click", "rich"]
 
 [project.optional-dependencies]
-gym = ["gymnasium<=0.29.1", "numpy", "pandas", "fastparquet", "pygame"]
-web = [
-    "gunicorn",
-    "flask",
-    "flask_cors",
-    "flask_sqlalchemy",
-    "sqlalchemy",
-    "psycopg2-binary",
-]
 dev = [
-    "black==25.11.0",
     "pytest",
     "pytest-benchmark",
-    "pytest-watch",
-    "coverage",
-    "coveralls",
 ]
-
-[project.urls]
-Homepage = "https://github.com/bcollazo/catanatron"
-Repository = "https://github.com/bcollazo/catanatron"
 
 [project.scripts]
 catanatron-play = "catanatron.cli.play:simulate"
 
 [tool.setuptools.packages.find]
 where = ["catanatron"]
-
-[tool.black]
-target-version = ["py311"]

@@ -100,10 +100,7 @@ def compute_metrics(
         policy_loss_sum += ploss.item()
 
         vt_clamped = vt.clamp(min=0.0)
-        vt_sum = vt_clamped.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        vt_normed = vt_clamped / vt_sum
-        vlp = F.log_softmax(value_logits, dim=-1)
-        vloss = -(vt_normed * vlp).sum(dim=-1).sum()
+        vloss = F.smooth_l1_loss(value_logits, vt_clamped, reduction="sum")
         value_loss_sum += vloss.item()
 
         for k in top_k:
@@ -114,8 +111,7 @@ def compute_metrics(
         true_winner = vt.argmax(dim=-1)
         value_correct += (pred_winner == true_winner).sum().item()
 
-        value_probs = F.softmax(value_logits, dim=-1)
-        brier_sum += ((value_probs - vt_normed) ** 2).sum(dim=-1).sum().item()
+        brier_sum += ((value_logits - vt_clamped) ** 2).sum(dim=-1).sum().item()
 
         action_idx_cpu = action_idx.cpu().numpy()
         pred_cpu = logits.argmax(dim=-1).cpu().numpy()

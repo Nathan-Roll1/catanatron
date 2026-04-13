@@ -26,6 +26,67 @@ import torch
 # In-memory dataset backed by concatenated tensors
 # ======================================================================
 
+def fix_action_masks(ff: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Zero out action slots the player can't afford based on resources and dev cards.
+
+    Skips examples during initial build phase (free placement).
+
+    flat_features layout (current player = slot 0):
+      1-5: resources/19 [wood, brick, sheep, wheat, ore]
+      6-10: dev cards in hand /14 [knight, yop, monopoly, road_building, vp]
+      19: has_played_dev
+      109: is_initial_build_phase
+    """
+    from hexzero.encoder.action_encoder import _MARITIME_PAIRS
+
+    is_initial = ff[:, 109] > 0.5
+    is_main = ~is_initial
+
+    res = (ff[:, 1:6] * 19).round()
+    wood, brick, sheep, wheat, ore = res[:, 0], res[:, 1], res[:, 2], res[:, 3], res[:, 4]
+    res_by_idx = [wood, brick, sheep, wheat, ore]
+
+    dev_cards = (ff[:, 6:11] * 14).round()
+    has_played_dev = ff[:, 19] > 0.5
+
+    mask = mask.clone()
+
+    # Only apply resource gating to main-game examples (not initial placement)
+    cant_sett = is_main & ~((wood >= 1) & (brick >= 1) & (sheep >= 1) & (wheat >= 1))
+    cant_city = is_main & ~((ore >= 3) & (wheat >= 2))
+    cant_road = is_main & ~((wood >= 1) & (brick >= 1))
+    cant_dev = is_main & ~((ore >= 1) & (sheep >= 1) & (wheat >= 1))
+
+    mask[cant_sett, 5:59] = 0
+    mask[cant_city, 59:113] = 0
+    mask[cant_road, 113:185] = 0
+    mask[cant_dev, 2:3] = 0
+
+    for i, (give_res, _recv) in enumerate(_MARITIME_PAIRS):
+        idx = 310 + i
+        if idx < mask.shape[1]:
+            mask[is_main & (res_by_idx[give_res] < 2), idx] = 0
+
+    for block_base, min_give in [(337, 1), (357, 1), (377, 2)]:
+        for i in range(20):
+            idx = block_base + i
+            if idx < mask.shape[1]:
+                give_res = i // 4
+                mask[is_main & (res_by_idx[give_res] < min_give), idx] = 0
+
+    no_knight = is_main & ((dev_cards[:, 0] < 1) | has_played_dev)
+    no_rb = is_main & ((dev_cards[:, 3] < 1) | has_played_dev)
+    no_yop = is_main & ((dev_cards[:, 1] < 1) | has_played_dev)
+    no_mono = is_main & ((dev_cards[:, 2] < 1) | has_played_dev)
+
+    mask[no_knight, 3:4] = 0
+    mask[no_rb, 4:5] = 0
+    mask[no_yop, 285:305] = 0
+    mask[no_mono, 305:310] = 0
+
+    return mask
+
+
 class HumanGameDataset:
     """Memory-mapped tensor dataset for training."""
 
@@ -107,17 +168,24 @@ def load_tensor_shards(data_dir: str, max_examples: int = 0) -> HumanGameDataset
         players = data["player"].numpy()
         reward_vecs = data["reward_vec"].numpy()
         S = players.shape[0]
+        winners = reward_vecs.argmax(axis=1)
         vt = np.zeros((S, 4), dtype=np.float32)
-        for i in range(S):
-            rv = reward_vecs[i]
-            rot = np.roll(rv, -int(players[i]))
-            rsum = rot.sum()
-            vt[i] = rot / rsum if rsum > 1e-8 else 0.25
+        vt[np.arange(S), winners] = 1.0
+        bad = reward_vecs.max(axis=1) < 1e-8
+        vt[bad] = 0.25
+        shifts = (-players % 4).astype(np.int32)
+        idx = (np.arange(4)[None, :] + shifts[:, None]) % 4
+        vt = np.take_along_axis(vt, idx, axis=1)
 
         all_nf.append(data["node_features"])
         all_ef.append(data["edge_features"])
         all_ff.append(data["flat_features"])
-        all_mask.append(data["action_mask"])
+        # Pad mask to 397 if needed (AB2 data has 337, human data has 397)
+        mask = data["action_mask"]
+        if mask.shape[-1] < 397:
+            pad = torch.zeros(mask.shape[0], 397 - mask.shape[-1], dtype=mask.dtype)
+            mask = torch.cat([mask, pad], dim=-1)
+        all_mask.append(mask)
         all_act.append(data["action_idx"])
         all_vt.append(torch.from_numpy(vt))
         total += S
@@ -128,12 +196,19 @@ def load_tensor_shards(data_dir: str, max_examples: int = 0) -> HumanGameDataset
         if max_examples > 0 and total >= max_examples:
             break
 
+    all_ff_t = torch.cat(all_ff)
+    all_mask_t = torch.cat(all_mask)
+    all_act_t = torch.cat(all_act)
+    all_mask_t = fix_action_masks(all_ff_t, all_mask_t)
+    # Ensure the ground-truth action is always marked legal
+    all_mask_t[torch.arange(len(all_act_t)), all_act_t] = 1.0
+
     ds = HumanGameDataset(
         nf=torch.cat(all_nf),
         ef=torch.cat(all_ef),
-        ff=torch.cat(all_ff),
-        mask=torch.cat(all_mask),
-        action_idx=torch.cat(all_act),
+        ff=all_ff_t,
+        mask=all_mask_t,
+        action_idx=all_act_t,
         value_target=torch.cat(all_vt),
     )
     if max_examples > 0 and ds.n > max_examples:
@@ -376,6 +451,7 @@ def _match_event_to_action(
         AT_BUILD_SETTLEMENT, AT_BUILD_CITY, AT_BUILD_ROAD,
         AT_DISCARD_RESOURCE, AT_PLAY_MONOPOLY,
         AT_PLAY_YEAR_OF_PLENTY, AT_MARITIME_TRADE,
+        AT_MOVE_ROBBER,
     )
 
     target_type = {
@@ -391,10 +467,27 @@ def _match_event_to_action(
         _EVT_MONOPOLY: AT_PLAY_MONOPOLY,
         _EVT_YEAR_OF_PLENTY: AT_PLAY_YEAR_OF_PLENTY,
         _EVT_MARITIME_TRADE: AT_MARITIME_TRADE,
+        _EVT_MOVE_ROBBER: AT_MOVE_ROBBER,
     }.get(evt_type)
 
     if target_type is None:
         return None
+
+    if target_type == AT_MOVE_ROBBER:
+        # Prefer steal variants (value[3] >= 0) over no-steal (value[3] == -1).
+        # The C engine lists no-steal first per tile, so a naive first-match
+        # always picks no-steal. Humans steal ~90%+ of the time.
+        steal_idx = None
+        no_steal_idx = None
+        for i, act in enumerate(legal):
+            if act.type == AT_MOVE_ROBBER:
+                if act.value[3] >= 0:
+                    if steal_idx is None:
+                        steal_idx = i
+                else:
+                    if no_steal_idx is None:
+                        no_steal_idx = i
+        return steal_idx if steal_idx is not None else no_steal_idx
 
     for i, act in enumerate(legal):
         if act.type == target_type:
