@@ -6,10 +6,10 @@
 /* Architecture constants (must match export) */
 #define NN_NODES        54
 #define NN_MAX_EDGES    144
-#define NN_GNN_HIDDEN   64
+#define NN_GNN_HIDDEN   80
 #define NN_GNN_OUTPUT   128
 #define NN_GNN_LAYERS   4
-#define NN_TRUNK_CH     128
+#define NN_TRUNK_CH     192
 #define NN_TRUNK_BLOCKS 6
 #define NN_VALUE_HIDDEN 128
 #define NN_FLAT_DIM     115
