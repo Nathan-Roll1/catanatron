@@ -438,44 +438,28 @@ static int abt_search(const NNModel *m, Game *g,
 }
 
 
-/* ── AB2 2-ply greedy search ──────────────────────────────────── */
+/* ── Proper Alpha-Beta search (catanatron semantics) ──────────── */
 
-static int ab2_choose(Game *g, const Action *le, int n_le) {
+#include "search.h"
+
+static double base_value_wrapper(Game *g, Color color) {
+    return base_value_fn(g, color);
+}
+
+static int ab2_choose(Game *g, Action *le, int n_le) {
     Color bc = g->state.colors[g->state.current_player_index];
-    int best_i = 0;
-    double best_v = -1e30;
-    Game ch, ch2;
-    Action ca[MAX_ACTIONS], ca2[MAX_ACTIONS];
-    int cn, cn2;
-
+    SearchCtx ctx = {0};
+    Action acts_copy[MAX_ACTIONS];
+    memcpy(acts_copy, le, n_le * sizeof(Action));
+    SearchResult r = alphabeta_search(&ctx, g, acts_copy, n_le,
+                                       2, -1e30, 1e30, bc,
+                                       base_value_wrapper);
+    /* Find original index of chosen action */
     for (int i = 0; i < n_le; i++) {
-        game_copy(&ch, g);
-        game_execute(&ch, le[i], ca, &cn);
-        double v;
-        if (cn > 0 && game_winning_color(&ch) == COLOR_NONE) {
-            if (cn > 1) {
-                Color bc2 = ch.state.colors[ch.state.current_player_index];
-                int brj = 0;
-                double brv = -1e30;
-                for (int j = 0; j < cn; j++) {
-                    game_copy(&ch2, &ch);
-                    game_execute(&ch2, ca[j], ca2, &cn2);
-                    double rv = base_value_fn(&ch2, bc2);
-                    if (rv > brv) { brv = rv; brj = j; }
-                }
-                game_copy(&ch2, &ch);
-                game_execute(&ch2, ca[brj], ca2, &cn2);
-                v = base_value_fn(&ch2, bc);
-            } else {
-                game_execute(&ch, ca[0], ca, &cn);
-                v = base_value_fn(&ch, bc);
-            }
-        } else {
-            v = base_value_fn(&ch, bc);
-        }
-        if (v > best_v) { best_v = v; best_i = i; }
+        if (memcmp(&le[i], &r.action, sizeof(Action)) == 0)
+            return i;
     }
-    return best_i;
+    return 0;
 }
 
 
