@@ -487,7 +487,7 @@ int main(int argc, char **argv) {
     int search_depth = 30;
     int top_k = 5;
     bool verbose = false;
-    bool vs_ab2 = false;
+    int mode = 0;  /* 0=selfplay, 1=2v2, 2=1v3 */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
@@ -501,7 +501,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--verbose") == 0)
             verbose = true;
         else if (strcmp(argv[i], "--vs-ab2") == 0)
-            vs_ab2 = true;
+            mode = 1;
+        else if (strcmp(argv[i], "--1v3") == 0)
+            mode = 2;
         else if (argv[i][0] != '-')
             seed_base = (uint64_t)atoll(argv[i]);
     }
@@ -532,6 +534,7 @@ int main(int argc, char **argv) {
     CatanMap map;
     RngState map_rng;
     Color colors[4] = {0, 1, 2, 3};
+    int nn_wins = 0, ab_wins = 0;
     int wins[4] = {0};
     int total_turns = 0;
 
@@ -543,6 +546,20 @@ int main(int argc, char **argv) {
         rng_init(&map_rng, seed);
         build_map(&map, MAP_BASE, 0, &map_rng);
 
+        /* Determine NN seats with rotation across games */
+        bool nn_seat[4] = {true, true, true, true};
+        if (mode == 1) {
+            /* 2v2: rotate which pair is NN */
+            int offset = gi % 4;
+            for (int s = 0; s < 4; s++)
+                nn_seat[s] = (s == offset % 4 || s == (offset + 2) % 4);
+        } else if (mode == 2) {
+            /* 1v3: rotate which single seat is NN */
+            int nn_idx = gi % 4;
+            for (int s = 0; s < 4; s++)
+                nn_seat[s] = (s == nn_idx);
+        }
+
         Game g;
         game_init_with_map(&g, &map, 4, colors, seed, 7, false, 10);
         int decisions = 0;
@@ -552,7 +569,6 @@ int main(int argc, char **argv) {
             if (n_act == 0) break;
 
             int cp = g.state.current_player_index;
-            bool is_ab2_seat = vs_ab2 && (cp == 1 || cp == 3);
             int chosen;
             if (n_act == 1) {
                 chosen = 0;
@@ -561,8 +577,23 @@ int main(int argc, char **argv) {
                     format_action(buf, sizeof(buf), actions[0]);
                     printf("  T%3d P%d %s (forced)\n", g.state.num_turns, cp, buf);
                 }
-            } else if (is_ab2_seat) {
+            } else if (mode > 0 && !nn_seat[cp]) {
                 chosen = ab2_choose(&g, actions, n_act);
+                decisions++;
+            } else if (search_depth == 0) {
+                /* Pure policy argmax — no search */
+                encode_state(&g, model, nf, ef, ff);
+                encode_action_mask(model, actions, n_act, mk);
+                NNOutput out;
+                nn_forward(model, nf, ef, ff, mk, &out);
+                int best_i = 0;
+                float best_v = -1e30f;
+                for (int ai = 0; ai < n_act; ai++) {
+                    int idx = action_to_idx(model, actions[ai]);
+                    float v = (idx >= 0 && idx < AD) ? out.policy[idx] : -1e30f;
+                    if (v > best_v) { best_v = v; best_i = ai; }
+                }
+                chosen = best_i;
                 decisions++;
             } else {
                 chosen = abt_search(model, &g, actions, n_act,
@@ -580,7 +611,14 @@ int main(int argc, char **argv) {
         }
 
         Color winner = game_winning_color(&g);
-        if (winner != COLOR_NONE) wins[g.state.color_to_index[winner]]++;
+        if (winner != COLOR_NONE) {
+            int wi = g.state.color_to_index[winner];
+            wins[wi]++;
+            if (mode > 0) {
+                if (nn_seat[wi]) nn_wins++;
+                else ab_wins++;
+            }
+        }
         total_turns += g.state.num_turns;
 
         if (num_games == 1) {
@@ -603,11 +641,12 @@ int main(int argc, char **argv) {
         printf("%d games in %.1fs (%.1f games/sec)\n",
                num_games, elapsed, num_games / elapsed);
         printf("Avg turns: %.0f\n", (double)total_turns / num_games);
-        if (vs_ab2) {
-            int nn_w = wins[0] + wins[2];
-            int ab_w = wins[1] + wins[3];
-            printf("NN(P0+P2)=%d  AB2(P1+P3)=%d  WR=%.0f%%\n",
-                   nn_w, ab_w, 100.0 * nn_w / (nn_w + ab_w + 1e-8));
+        if (mode == 1) {
+            printf("2v2: NN=%d  AB2=%d  WR=%.1f%%\n",
+                   nn_wins, ab_wins, 100.0 * nn_wins / (nn_wins + ab_wins + 1e-8));
+        } else if (mode == 2) {
+            printf("1v3: NN=%d  AB2=%d  WR=%.1f%%\n",
+                   nn_wins, ab_wins, 100.0 * nn_wins / (nn_wins + ab_wins + 1e-8));
         } else {
             printf("Wins: P0=%d P1=%d P2=%d P3=%d\n",
                    wins[0], wins[1], wins[2], wins[3]);
