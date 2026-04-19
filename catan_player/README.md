@@ -10,24 +10,21 @@ policy and hand-crafted value function. No Python, no external dependencies.
 ./catan_player
 ```
 
-## Evaluation
+## NN vs AB2 Evaluation
+
+The neural network (0-ply policy argmax) vs AB2 (2-ply greedy heuristic):
 
 ```bash
-# 2v2: 2 NN seats vs 2 AB2 (2-ply heuristic) seats
+# 2v2: 2 NN seats vs 2 AB2 seats (500 games, ~12s)
 ./catan_player --games 500 --depth 0 --vs-ab2 --seed 1000
 # Expected: NN ~56% WR
 
-# 1v3: 1 NN seat vs 3 AB2 seats
+# 1v3: 1 NN seat vs 3 AB2 seats (500 games, ~8s)
 ./catan_player --games 500 --depth 0 --1v3 --seed 1000
 # Expected: NN ~35% WR (25% = random baseline)
-
-# With search (ABt30): stronger but slower
-./catan_player --games 50 --depth 30 --vs-ab2 --seed 1000
-# Expected: NN ~60% WR
-
-# Self-play (4x same NN)
-./catan_player --games 100 --depth 0 --seed 1000
 ```
+
+NN seat assignments rotate across games to eliminate positional bias.
 
 ## Options
 
