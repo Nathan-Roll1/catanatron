@@ -13,7 +13,7 @@ CSRC="$SCRIPT_DIR/csrc"
 OUT="$SCRIPT_DIR/catan_player"
 
 CC="${CC:-cc}"
-CFLAGS="-O3 -march=native -flto -I${CSRC}"
+CFLAGS="-O3 -march=native -flto -ffast-math -funroll-loops -I${CSRC}"
 LDFLAGS="-lm"
 
 case "$(uname -s)" in

@@ -438,6 +438,47 @@ static int abt_search(const NNModel *m, Game *g,
 }
 
 
+/* ── AB2 2-ply greedy search ──────────────────────────────────── */
+
+static int ab2_choose(Game *g, const Action *le, int n_le) {
+    Color bc = g->state.colors[g->state.current_player_index];
+    int best_i = 0;
+    double best_v = -1e30;
+    Game ch, ch2;
+    Action ca[MAX_ACTIONS], ca2[MAX_ACTIONS];
+    int cn, cn2;
+
+    for (int i = 0; i < n_le; i++) {
+        game_copy(&ch, g);
+        game_execute(&ch, le[i], ca, &cn);
+        double v;
+        if (cn > 0 && game_winning_color(&ch) == COLOR_NONE) {
+            if (cn > 1) {
+                Color bc2 = ch.state.colors[ch.state.current_player_index];
+                int brj = 0;
+                double brv = -1e30;
+                for (int j = 0; j < cn; j++) {
+                    game_copy(&ch2, &ch);
+                    game_execute(&ch2, ca[j], ca2, &cn2);
+                    double rv = base_value_fn(&ch2, bc2);
+                    if (rv > brv) { brv = rv; brj = j; }
+                }
+                game_copy(&ch2, &ch);
+                game_execute(&ch2, ca[brj], ca2, &cn2);
+                v = base_value_fn(&ch2, bc);
+            } else {
+                game_execute(&ch, ca[0], ca, &cn);
+                v = base_value_fn(&ch, bc);
+            }
+        } else {
+            v = base_value_fn(&ch, bc);
+        }
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    return best_i;
+}
+
+
 /* ── Main ───────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -446,6 +487,7 @@ int main(int argc, char **argv) {
     int search_depth = 30;
     int top_k = 5;
     bool verbose = false;
+    bool vs_ab2 = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
@@ -458,6 +500,8 @@ int main(int argc, char **argv) {
             top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--verbose") == 0)
             verbose = true;
+        else if (strcmp(argv[i], "--vs-ab2") == 0)
+            vs_ab2 = true;
         else if (argv[i][0] != '-')
             seed_base = (uint64_t)atoll(argv[i]);
     }
@@ -508,6 +552,7 @@ int main(int argc, char **argv) {
             if (n_act == 0) break;
 
             int cp = g.state.current_player_index;
+            bool is_ab2_seat = vs_ab2 && (cp == 1 || cp == 3);
             int chosen;
             if (n_act == 1) {
                 chosen = 0;
@@ -516,6 +561,9 @@ int main(int argc, char **argv) {
                     format_action(buf, sizeof(buf), actions[0]);
                     printf("  T%3d P%d %s (forced)\n", g.state.num_turns, cp, buf);
                 }
+            } else if (is_ab2_seat) {
+                chosen = ab2_choose(&g, actions, n_act);
+                decisions++;
             } else {
                 chosen = abt_search(model, &g, actions, n_act,
                                     search_depth, top_k, nf, ef, ff, mk);
@@ -555,8 +603,15 @@ int main(int argc, char **argv) {
         printf("%d games in %.1fs (%.1f games/sec)\n",
                num_games, elapsed, num_games / elapsed);
         printf("Avg turns: %.0f\n", (double)total_turns / num_games);
-        printf("Wins: P0=%d P1=%d P2=%d P3=%d\n",
-               wins[0], wins[1], wins[2], wins[3]);
+        if (vs_ab2) {
+            int nn_w = wins[0] + wins[2];
+            int ab_w = wins[1] + wins[3];
+            printf("NN(P0+P2)=%d  AB2(P1+P3)=%d  WR=%.0f%%\n",
+                   nn_w, ab_w, 100.0 * nn_w / (nn_w + ab_w + 1e-8));
+        } else {
+            printf("Wins: P0=%d P1=%d P2=%d P3=%d\n",
+                   wins[0], wins[1], wins[2], wins[3]);
+        }
     }
 
     free(nf); free(ef); free(ff); free(mk); free(actions); free(model);
