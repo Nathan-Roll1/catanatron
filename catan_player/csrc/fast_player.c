@@ -446,20 +446,23 @@ static double base_value_wrapper(Game *g, Color color) {
     return base_value_fn(g, color);
 }
 
-static int ab2_choose(Game *g, Action *le, int n_le) {
+static int ab_choose(Game *g, Action *le, int n_le, int depth) {
     Color bc = g->state.colors[g->state.current_player_index];
     SearchCtx ctx = {0};
     Action acts_copy[MAX_ACTIONS];
     memcpy(acts_copy, le, n_le * sizeof(Action));
     SearchResult r = alphabeta_search(&ctx, g, acts_copy, n_le,
-                                       2, -1e30, 1e30, bc,
+                                       depth, -1e30, 1e30, bc,
                                        base_value_wrapper);
-    /* Find original index of chosen action */
     for (int i = 0; i < n_le; i++) {
         if (memcmp(&le[i], &r.action, sizeof(Action)) == 0)
             return i;
     }
     return 0;
+}
+
+static int ab2_choose(Game *g, Action *le, int n_le) {
+    return ab_choose(g, le, n_le, 2);
 }
 
 
@@ -471,7 +474,8 @@ int main(int argc, char **argv) {
     int search_depth = 30;
     int top_k = 5;
     bool verbose = false;
-    int mode = 0;  /* 0=selfplay, 1=2v2, 2=1v3 */
+    int mode = 0;  /* 0=selfplay, 1=2v2, 2=1v3, 3=ab2-only */
+    int ab_depth = 2;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
@@ -488,6 +492,10 @@ int main(int argc, char **argv) {
             mode = 1;
         else if (strcmp(argv[i], "--1v3") == 0)
             mode = 2;
+        else if (strcmp(argv[i], "--ab2-only") == 0)
+            mode = 3;
+        else if (strcmp(argv[i], "--ab-depth") == 0 && i+1 < argc)
+            ab_depth = atoi(argv[++i]);
         else if (argv[i][0] != '-')
             seed_base = (uint64_t)atoll(argv[i]);
     }
@@ -533,15 +541,15 @@ int main(int argc, char **argv) {
         /* Determine NN seats with rotation across games */
         bool nn_seat[4] = {true, true, true, true};
         if (mode == 1) {
-            /* 2v2: rotate which pair is NN */
             int offset = gi % 4;
             for (int s = 0; s < 4; s++)
                 nn_seat[s] = (s == offset % 4 || s == (offset + 2) % 4);
         } else if (mode == 2) {
-            /* 1v3: rotate which single seat is NN */
             int nn_idx = gi % 4;
             for (int s = 0; s < 4; s++)
                 nn_seat[s] = (s == nn_idx);
+        } else if (mode == 3) {
+            for (int s = 0; s < 4; s++) nn_seat[s] = false;
         }
 
         Game g;
@@ -562,7 +570,7 @@ int main(int argc, char **argv) {
                     printf("  T%3d P%d %s (forced)\n", g.state.num_turns, cp, buf);
                 }
             } else if (mode > 0 && !nn_seat[cp]) {
-                chosen = ab2_choose(&g, actions, n_act);
+                chosen = ab_choose(&g, actions, n_act, ab_depth);
                 decisions++;
             } else if (search_depth == 0) {
                 /* Pure policy argmax — no search */
@@ -626,11 +634,16 @@ int main(int argc, char **argv) {
                num_games, elapsed, num_games / elapsed);
         printf("Avg turns: %.0f\n", (double)total_turns / num_games);
         if (mode == 1) {
-            printf("2v2: NN=%d  AB2=%d  WR=%.1f%%\n",
-                   nn_wins, ab_wins, 100.0 * nn_wins / (nn_wins + ab_wins + 1e-8));
+            printf("2v2: NN=%d  AB2=%d  WR=%.1f%%  (ab_depth=%d)\n",
+                   nn_wins, ab_wins,
+                   100.0 * nn_wins / (nn_wins + ab_wins + 1e-8), ab_depth);
         } else if (mode == 2) {
-            printf("1v3: NN=%d  AB2=%d  WR=%.1f%%\n",
-                   nn_wins, ab_wins, 100.0 * nn_wins / (nn_wins + ab_wins + 1e-8));
+            printf("1v3: NN=%d  AB2=%d  WR=%.1f%%  (ab_depth=%d)\n",
+                   nn_wins, ab_wins,
+                   100.0 * nn_wins / (nn_wins + ab_wins + 1e-8), ab_depth);
+        } else if (mode == 3) {
+            printf("4xAB%d: P0=%d P1=%d P2=%d P3=%d\n",
+                   ab_depth, wins[0], wins[1], wins[2], wins[3]);
         } else {
             printf("Wins: P0=%d P1=%d P2=%d P3=%d\n",
                    wins[0], wins[1], wins[2], wins[3]);

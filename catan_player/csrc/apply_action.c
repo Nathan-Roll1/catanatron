@@ -302,9 +302,8 @@ static void do_build_city(State *s, Action a) {
         s->resource_freqdeck[r] += CITY_COST[r];
 }
 
-static void do_buy_dev_card(State *s, Action a) {
+static void do_buy_dev_card_core(State *s, Action a, int card) {
     int idx = s->color_to_index[(int)a.color];
-    int card = s->development_listdeck[s->dev_deck_size - 1];
     s->dev_deck_size--;
 
     s->player_state[idx][PS_DEV_IN_HAND(card)]++;
@@ -317,13 +316,28 @@ static void do_buy_dev_card(State *s, Action a) {
     }
 }
 
-static void do_roll(State *s, Action a, RngState *rng) {
+static void do_buy_dev_card(State *s, Action a) {
+    int card = s->development_listdeck[s->dev_deck_size - 1];
+    do_buy_dev_card_core(s, a, card);
+}
+
+void apply_buy_dev_card_forced(State *s, Action a, int dev_card) {
+    /* Remove one card of the forced type from the deck (best-effort);
+     * the absolute deck order doesn't matter for value, only composition. */
+    for (int i = s->dev_deck_size - 1; i >= 0; i--) {
+        if (s->development_listdeck[i] == dev_card) {
+            for (int j = i; j < s->dev_deck_size - 1; j++) {
+                s->development_listdeck[j] = s->development_listdeck[j + 1];
+            }
+            break;
+        }
+    }
+    do_buy_dev_card_core(s, a, dev_card);
+}
+
+static void do_roll_core(State *s, Action a, int number) {
     int idx = s->color_to_index[(int)a.color];
     s->player_state[idx][PS_HAS_ROLLED] = 1;
-
-    int d1 = rng_randint(rng, 1, 6);
-    int d2 = rng_randint(rng, 1, 6);
-    int number = d1 + d2;
 
     if (number == 7) {
         int first_discard = -1;
@@ -347,6 +361,16 @@ static void do_roll(State *s, Action a, RngState *rng) {
         yield_resources(s, number);
         s->current_prompt = PROMPT_PLAY_TURN;
     }
+}
+
+static void do_roll(State *s, Action a, RngState *rng) {
+    int d1 = rng_randint(rng, 1, 6);
+    int d2 = rng_randint(rng, 1, 6);
+    do_roll_core(s, a, d1 + d2);
+}
+
+void apply_roll_forced(State *s, Action a, int dice_sum) {
+    do_roll_core(s, a, dice_sum);
 }
 
 static void do_discard(State *s, Action a) {
@@ -373,13 +397,32 @@ static void do_discard(State *s, Action a) {
     }
 }
 
+static void do_move_robber_core(State *s, Action a, int forced_steal) {
+    /* forced_steal: -1 = pick randomly later (caller responsibility),
+     * 0..4 = force that resource if available. */
+    Coordinate coord = {a.value[0], a.value[1], a.value[2]};
+    int robbed_color = a.value[3];
+
+    if (robbed_color != COLOR_NONE && forced_steal >= 0 && forced_steal < 5) {
+        int ri = s->color_to_index[robbed_color];
+        if (s->player_state[ri][PS_RESOURCE_IN_HAND(forced_steal)] > 0) {
+            int ai = s->color_to_index[(int)a.color];
+            s->player_state[ri][PS_RESOURCE_IN_HAND(forced_steal)]--;
+            s->player_state[ai][PS_RESOURCE_IN_HAND(forced_steal)]++;
+        }
+        /* If forced_steal isn't in hand, no transfer happens (matches Python's
+         * "ignore impossible imagined outcomes" behavior). */
+    }
+    s->board.robber_coordinate = coord;
+    s->current_prompt = PROMPT_PLAY_TURN;
+}
+
 static void do_move_robber(State *s, Action a, RngState *rng) {
     Coordinate coord = {a.value[0], a.value[1], a.value[2]};
     int robbed_color = a.value[3];
 
     if (robbed_color != COLOR_NONE) {
         int ri = s->color_to_index[robbed_color];
-        /* Random steal: build array of resources in hand, pick one */
         int hand[256];
         int hand_count = 0;
         for (int r = 0; r < 5; r++) {
@@ -397,6 +440,10 @@ static void do_move_robber(State *s, Action a, RngState *rng) {
     }
     s->board.robber_coordinate = coord;
     s->current_prompt = PROMPT_PLAY_TURN;
+}
+
+void apply_move_robber_forced(State *s, Action a, int forced_steal) {
+    do_move_robber_core(s, a, forced_steal);
 }
 
 static void do_play_knight(State *s, Action a) {
