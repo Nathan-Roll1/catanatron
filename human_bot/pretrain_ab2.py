@@ -46,9 +46,10 @@ def load_shard_group(fnames):
         vt[np.arange(S), winners] = 1.0
         bad = rv.max(axis=1) < 1e-8
         vt[bad] = 0.25
-        shifts = (-players % 4).astype(np.int32)
-        idx_arr = (np.arange(4)[None, :] + shifts[:, None]) % 4
-        vt = np.take_along_axis(vt, idx_arr, axis=1)
+        from human_bot.dataset import rotate_value_targets_to_cp
+        n_p = data.get("num_players")
+        vt = rotate_value_targets_to_cp(
+            vt, players, n_p.numpy() if n_p is not None else None)
 
         mask = data["action_mask"]
         if mask.shape[-1] < 397:

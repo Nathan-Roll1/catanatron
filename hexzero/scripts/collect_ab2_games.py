@@ -140,8 +140,9 @@ def _save_batch(games_data, output_dir, file_id):
     """
     all_nf, all_ef, all_ff = [], [], []
     all_mask, all_act, all_player, all_reward, all_gid = [], [], [], [], []
+    all_np = []
 
-    for gid, (nf_l, ef_l, ff_l, mk_l, ac_l, pl_l, rv) in enumerate(games_data):
+    for gid, (nf_l, ef_l, ff_l, mk_l, ac_l, pl_l, rv, n_p) in enumerate(games_data):
         n = len(nf_l)
         if n == 0:
             continue
@@ -153,6 +154,7 @@ def _save_batch(games_data, output_dir, file_id):
         all_player.extend(pl_l)
         all_reward.extend([rv] * n)
         all_gid.extend([gid] * n)
+        all_np.extend([n_p] * n)
 
     if not all_nf:
         return 0
@@ -166,6 +168,7 @@ def _save_batch(games_data, output_dir, file_id):
         "player": torch.tensor(all_player, dtype=torch.int64),
         "reward_vec": torch.from_numpy(np.stack(all_reward)),
         "game_id": torch.tensor(all_gid, dtype=torch.int64),
+        "num_players": torch.tensor(all_np, dtype=torch.int64),
     }
 
     path = os.path.join(output_dir, f"{file_id}.pt")
@@ -282,7 +285,8 @@ def _worker_fn(worker_id, num_games, output_dir, games_per_file,
 
         reward_vec = _compute_rewards(game)
         batch.append((nf_list, ef_list, ff_list,
-                       mask_list, act_list, player_list, reward_vec))
+                       mask_list, act_list, player_list, reward_vec,
+                       n_players))
 
         w = game.winner()
         if w is not None:

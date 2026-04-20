@@ -23,6 +23,64 @@ import torch
 
 
 # ======================================================================
+# Value-target rotation helper
+# ======================================================================
+
+def rotate_value_targets_to_cp(
+    vt: np.ndarray,
+    players: np.ndarray,
+    num_players: np.ndarray | int | None = None,
+) -> np.ndarray:
+    """Rotate absolute-seat value targets so slot 0 = cp, slot i = seat (cp+i) % N.
+
+    This matches the state encoder convention
+    ``flat_slot_i = player_state[(cp + i) % num_players]``, so training and
+    inference both read/write "reward for seat (cp + i) % N" at output slot ``i``.
+
+    Args:
+        vt: absolute-seat value targets, shape ``(S, 4)``.
+        players: current player index per row, shape ``(S,)``.
+        num_players: per-row player count (shape ``(S,)`` or scalar), or None
+            to default to 4-player rotation. When ``num_players[i] < 4``, slots
+            ``>= num_players[i]`` in the output are zeroed.
+
+    Returns:
+        Rotated value targets, shape ``(S, 4)``.
+    """
+    vt = np.asarray(vt)
+    players = np.asarray(players, dtype=np.int64)
+    S = vt.shape[0]
+
+    if num_players is None:
+        # Legacy 4-player rotation (fixed sign: +players, not -players, so
+        # slot 0 truly = cp's reward).
+        shifts = (players % 4).astype(np.int64)
+        idx_arr = (np.arange(4)[None, :] + shifts[:, None]) % 4
+        return np.take_along_axis(vt, idx_arr, axis=1)
+
+    if np.isscalar(num_players):
+        num_players = np.full(S, int(num_players), dtype=np.int64)
+    else:
+        num_players = np.asarray(num_players, dtype=np.int64)
+
+    out = np.zeros_like(vt)
+    # Vectorised per-num_players grouping
+    for n_p in np.unique(num_players):
+        rows = num_players == n_p
+        if not rows.any():
+            continue
+        cp_rows = players[rows] % n_p
+        # For slot j in [0, n_p): out[i, j] = vt[i, (cp_rows[i] + j) % n_p]
+        j_idx = np.arange(n_p)[None, :]  # (1, n_p)
+        src = (cp_rows[:, None] + j_idx) % n_p  # (num_rows, n_p)
+        # vt has 4 columns; for j in [0, n_p), take from src; for j >= n_p leave 0
+        out_rows = np.zeros((rows.sum(), 4), dtype=vt.dtype)
+        out_rows[:, :n_p] = np.take_along_axis(vt[rows], src, axis=1)
+        out[rows] = out_rows
+    return out
+
+
+# ======================================================================
 # In-memory dataset backed by concatenated tensors
 # ======================================================================
 
@@ -173,9 +231,10 @@ def load_tensor_shards(data_dir: str, max_examples: int = 0) -> HumanGameDataset
         vt[np.arange(S), winners] = 1.0
         bad = reward_vecs.max(axis=1) < 1e-8
         vt[bad] = 0.25
-        shifts = (-players % 4).astype(np.int32)
-        idx = (np.arange(4)[None, :] + shifts[:, None]) % 4
-        vt = np.take_along_axis(vt, idx, axis=1)
+        n_p_tensor = data.get("num_players")
+        vt = rotate_value_targets_to_cp(
+            vt, players,
+            n_p_tensor.numpy() if n_p_tensor is not None else None)
 
         all_nf.append(data["node_features"])
         all_ef.append(data["edge_features"])

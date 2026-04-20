@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 from human_bot.config import HumanBotTrainingConfig
-from human_bot.dataset import HumanGameDataset
+from human_bot.dataset import HumanGameDataset, rotate_value_targets_to_cp
 from human_bot.loss import UncertaintyWeightedLoss
 from human_bot.model import HumanBotNet, SmallNetworkConfig
 from human_bot.train import DeviceDataset, build_cosine_scheduler, train_epoch
@@ -60,9 +60,9 @@ def load_shard_group(data_dir: str, shard_files: list[str], device: str,
         vt = np.zeros((S, 4), dtype=np.float32)
         vt[np.arange(S), winners] = 1.0
         vt[rv.max(axis=1) < 1e-8] = 0.25
-        shifts = (-players % 4).astype(np.int32)
-        idx_arr = (np.arange(4)[None, :] + shifts[:, None]) % 4
-        vt = np.take_along_axis(vt, idx_arr, axis=1)
+        n_p = d.get("num_players")
+        n_p_arr = n_p.numpy() if n_p is not None else None
+        vt = rotate_value_targets_to_cp(vt, players, n_p_arr)
 
         mask = d["action_mask"]
         if mask.shape[-1] < 397:
@@ -304,8 +304,9 @@ def main():
                 p = d["player"].numpy(); rv = d["reward_vec"].numpy(); S = p.shape[0]
                 w = rv.argmax(axis=1); vt = np.zeros((S, 4), dtype=np.float32)
                 vt[np.arange(S), w] = 1.0; vt[rv.max(axis=1) < 1e-8] = 0.25
-                sh = (-p % 4).astype(np.int32); ix = (np.arange(4)[None, :] + sh[:, None]) % 4
-                vt = np.take_along_axis(vt, ix, axis=1)
+                n_p_eval = d.get("num_players")
+                vt = rotate_value_targets_to_cp(
+                    vt, p, n_p_eval.numpy() if n_p_eval is not None else None)
                 m = d["action_mask"]
                 if m.shape[-1] < 397:
                     m = torch.cat([m, torch.zeros(S, 397 - m.shape[-1], dtype=m.dtype)], dim=-1)

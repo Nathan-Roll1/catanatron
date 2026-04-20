@@ -81,7 +81,13 @@ def atomic_torch_save(data, path):
 def save_shard(games_data, output_dir, shard_id):
     all_nf, all_ef, all_ff = [], [], []
     all_mask, all_act, all_player, all_reward, all_sw = [], [], [], [], []
-    for steps, rv, sw in games_data:
+    all_np = []
+    for game in games_data:
+        if len(game) == 4:
+            steps, rv, sw, n_players = game
+        else:
+            steps, rv, sw = game
+            n_players = 4  # legacy: assume 4-player
         for i, s in enumerate(steps):
             all_nf.append(s["nf"])
             all_ef.append(s["ef"])
@@ -91,6 +97,7 @@ def save_shard(games_data, output_dir, shard_id):
             all_player.append(s["player"])
             all_reward.append(rv)
             all_sw.append(sw[i])
+            all_np.append(n_players)
     if not all_nf:
         return 0
     data = {
@@ -102,6 +109,7 @@ def save_shard(games_data, output_dir, shard_id):
         "player": torch.tensor(all_player, dtype=torch.int64),
         "reward_vec": torch.from_numpy(np.stack(all_reward)),
         "step_weight": torch.tensor(all_sw, dtype=torch.float32),
+        "num_players": torch.tensor(all_np, dtype=torch.int64),
     }
     atomic_torch_save(data, os.path.join(output_dir, f"{shard_id}.pt"))
     return len(all_nf)
@@ -400,7 +408,7 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
         games_by_pc[n_players] = games_by_pc.get(n_players, 0) + 1
         steps, rv, sw, winner = play_game(seed, temp, n_players)
 
-        game_batch.append((steps, rv, sw))
+        game_batch.append((steps, rv, sw, n_players))
         total_games += 1
         total_steps += len(steps)
         if winner is not None:
@@ -583,10 +591,12 @@ def _run_learner(checkpoint_path, weights_bin_path, shard_dir, ckpt_dir,
             no_winner = (row_sums < 1e-8).squeeze()
             vt = np.where(row_sums > 1e-8, rv_safe / row_sums, 0.25)
             vt[no_winner] = 0.25
-            # Rotate to current-player perspective
-            shifts = (-p % 4).astype(np.int32)
-            idx_arr = (np.arange(4)[None, :] + shifts[:, None]) % 4
-            vt = np.take_along_axis(vt, idx_arr, axis=1)
+            # Rotate absolute-seat targets → cp-relative slots matching encoder
+            # (slot 0 = cp, slot i = seat (cp+i) % N); zero slots beyond N.
+            from human_bot.dataset import rotate_value_targets_to_cp
+            n_p_tensor = d.get("num_players")
+            n_p_arr = n_p_tensor.numpy() if n_p_tensor is not None else None
+            vt = rotate_value_targets_to_cp(vt, p, n_p_arr)
 
             m = d["action_mask"]
             if m.shape[-1] < MASK_DIM:
