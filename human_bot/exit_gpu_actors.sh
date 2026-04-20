@@ -31,7 +31,7 @@ flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
 : "${NUM_ACTORS:=4}"
 : "${NUM_GPUS:=1}"
 : "${ACTOR_OFFSET:=0}"
-: "${SEARCH_DEPTH:=30}"
+: "${SEARCH_DEPTH:=15}"
 : "${TOP_K:=2}"
 : "${MAX_PENDING:=200}"
 : "${PLAYER_COUNTS:=2,3,4}"

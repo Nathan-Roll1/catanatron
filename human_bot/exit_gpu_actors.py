@@ -281,40 +281,69 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     # ── ABt search (NN policy + argmax rollout + AB2 leaf) ──────────
     def abt_search(game, le, depth, temperature):
         """For each top-k candidate, run depth-N argmax rollout, score with
-        AB2 leaf, sample with temperature."""
+        AB2 leaf, sample with temperature.
+
+        Candidates' rollouts run in lockstep — one batched NN forward per
+        ply across all live candidate clones. Cuts per-decision NN calls
+        from `top_k * (depth-1)` sequential to `(depth-1)` batched.
+        """
         seat = game.current_player()
         cands = policy_top_k(game, le, top_k)
-        values = np.zeros(len(cands), dtype=np.float32)
+        K = len(cands)
 
+        # Initialise candidate clones
+        clones = [game.clone() for _ in range(K)]
+        alive = [True] * K
         for p, ci in enumerate(cands):
-            gc = game.clone()
-            gc.step(ci)
-            # Argmax rollout for `depth-1` more plies
-            for ply in range(2, depth + 1):
-                if gc.is_terminal() or gc.turn_number >= MAX_TURNS:
-                    break
-                idx = nn_argmax_one(gc)
+            try:
+                clones[p].step(ci)
+                if clones[p].is_terminal() or clones[p].turn_number >= MAX_TURNS:
+                    alive[p] = False
+            except Exception:
+                alive[p] = False
+
+        # Lockstep argmax rollout, batched across alive clones
+        for ply in range(2, depth + 1):
+            live = [p for p, a in enumerate(alive) if a]
+            if not live:
+                break
+            sub = [clones[p] for p in live]
+            chosen_idxs = nn_argmax_batched(sub)
+            for j, p in enumerate(live):
+                gc = clones[p]
+                idx = chosen_idxs[j]
                 if idx is None:
-                    break
-                gc.step(idx)
-            # Leaf evaluation
+                    alive[p] = False
+                    continue
+                try:
+                    gc.step(idx)
+                except Exception:
+                    alive[p] = False
+                    continue
+                if gc.is_terminal() or gc.turn_number >= MAX_TURNS:
+                    alive[p] = False
+
+        # Leaf evaluation
+        values = np.zeros(K, dtype=np.float32)
+        for p in range(K):
+            gc = clones[p]
             if gc.is_terminal():
                 w = gc.winner()
                 v = 10.0 if (w is not None and w == seat) else (
                     -10.0 if w is not None else 0.0)
             else:
                 v = ab_leaf_eval(gc, seat)
-            v = apply_action_bonus(v, le[ci])
+            v = apply_action_bonus(v, le[cands[p]])
             values[p] = v
 
         # Temperature-sampled selection over top candidates
-        if len(cands) == 1 or temperature < 0.01:
+        if K == 1 or temperature < 0.01:
             best_p = int(np.argmax(values))
         else:
             shifted = values - values.max()
             probs = np.exp(shifted / temperature)
             probs /= probs.sum()
-            best_p = int(np.random.choice(len(cands), p=probs))
+            best_p = int(np.random.choice(K, p=probs))
         chosen = cands[best_p]
         return fix_robber_steal(chosen, le)
 
@@ -351,6 +380,12 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
 
             if len(le) == 1:
                 chosen = 0
+            elif g.turn_number <= 7:
+                # Early turns (initial placement, first roll): policy argmax,
+                # search adds little here and is wasteful
+                chosen = nn_argmax_one(g)
+                if chosen is None:
+                    chosen = 0
             else:
                 chosen = abt_search(g, le, search_depth, temperature)
 
