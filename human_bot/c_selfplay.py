@@ -147,11 +147,12 @@ def _load_c_nn(weights_path):
 def run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
               search_depth, seed_base, max_pending,
               explore_setup_frac=0.2, dirichlet_alpha=0.3,
-              dirichlet_frac=0.25):
+              dirichlet_frac=0.25, player_counts=(2, 3, 4)):
     try:
         _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
                    search_depth, seed_base, max_pending,
-                   explore_setup_frac, dirichlet_alpha, dirichlet_frac)
+                   explore_setup_frac, dirichlet_alpha, dirichlet_frac,
+                   player_counts)
     except Exception:
         print(f"!!! [c_actor {actor_id}] CRASHED !!!", flush=True)
         traceback.print_exc()
@@ -159,12 +160,14 @@ def run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
 
 def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
                search_depth, seed_base, max_pending,
-               explore_setup_frac, dirichlet_alpha, dirichlet_frac):
+               explore_setup_frac, dirichlet_alpha, dirichlet_frac,
+               player_counts):
     import sys
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+    from hexzero.config import GameConfig
     from hexzero.game.interface import CatanGame
     from hexzero.encoder.action_encoder import ActionEncoder
     from hexzero.bindings.lib_loader import load_library
@@ -174,6 +177,8 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
     ae = ActionEncoder()
     g0 = CatanGame(seed=0); g0.reset()
     se = g0.make_state_encoder()
+    pc_arr = np.asarray(player_counts, dtype=np.int64)
+    actor_rng = np.random.default_rng((seed_base + actor_id) ^ 0xC0DE)
     N, E = se.num_nodes, se.num_edges
     NF, EF, FFD = se.NODE_FEATURE_DIM, se.EDGE_FEATURE_DIM, se.FLAT_FEATURE_DIM
 
@@ -233,6 +238,7 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
 
     def nnt_search(game, le, depth, temperature=1.0, top_k=5):
         seat = game.current_player()
+        n_p = game.num_players
         candidates = list(range(len(le)))
         if len(le) > top_k and depth >= 2:
             candidates = c_topk(game, le, top_k)
@@ -253,7 +259,9 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
                     -10.0 if w is not None else 0.0)
             else:
                 vs = c_val(gc)
-                off = (seat - gc.current_player()) % 4
+                # Encoder rotates so the current player is slot 0; our seat
+                # is therefore (seat - cp) mod num_players in the value vec.
+                off = (seat - gc.current_player()) % n_p
                 v = float(vs[off])
             v = apply_action_bonus(v, le[ci])
             values[p] = v
@@ -273,8 +281,9 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
         best = candidates[chosen_p]
         return fix_robber_steal(best, le)
 
-    def play_game(seed, temperature):
-        game = CatanGame(seed=seed); game.reset()
+    def play_game(seed, temperature, num_players):
+        cfg = GameConfig(num_players=num_players)
+        game = CatanGame(seed=seed, config=cfg); game.reset()
         explore_setup = np.random.random() < explore_setup_frac
         steps = []
 
@@ -346,19 +355,17 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
         winner = game.winner()
         reward_vec = np.zeros(4, dtype=np.float32)
         if winner is not None:
-            reward_vec[winner] = 1.0
-            # Speed bonus: fast wins get higher reward, slow wins get less.
-            # Typical game is 150-300 turns. Scale winner reward by speed.
             turns = game.turn_number
             speed_bonus = max(0.0, min(0.5, (300 - turns) / 300.0))
-            reward_vec[winner] = 1.0 + speed_bonus  # 1.0-1.5 for winner
+            reward_vec[winner] = 1.0 + speed_bonus
 
-            # VP-graded losers: closer to winning = less negative signal
-            for seat in range(4):
+            # VP-graded losers: closer to winning = less negative signal.
+            # Iterate only over actual seats; unused seats stay at 0.
+            for seat in range(num_players):
                 if seat == winner:
                     continue
                 vp = game._game.state.player_state[seat][0]
-                reward_vec[seat] = vp / 20.0  # 0.0-0.5 range for losers
+                reward_vec[seat] = vp / 20.0
         sw = compute_step_weights(steps, reward_vec)
         return steps, reward_vec, sw, winner
 
@@ -380,15 +387,18 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
     total_games = 0
     total_steps = 0
     wins = np.zeros(4, dtype=np.int64)
+    games_by_pc = {int(pc): 0 for pc in pc_arr}
     t_start = time.time()
 
     print(f"[c_actor {actor_id}] Started, depth={search_depth}, "
-          f"seed_base={seed_base}", flush=True)
+          f"seed_base={seed_base}, player_counts={list(pc_arr)}", flush=True)
 
     while True:
         seed = seed_base + total_games
         temp = temperature_for_round(current_round)
-        steps, rv, sw, winner = play_game(seed, temp)
+        n_players = int(actor_rng.choice(pc_arr))
+        games_by_pc[n_players] = games_by_pc.get(n_players, 0) + 1
+        steps, rv, sw, winner = play_game(seed, temp, n_players)
 
         game_batch.append((steps, rv, sw))
         total_games += 1
@@ -414,10 +424,11 @@ def _run_actor(actor_id, weights_path, shard_dir, ckpt_dir,
             elapsed = time.time() - t_start
             gps = total_games / elapsed if elapsed > 0 else 0
             avg_s = total_steps / total_games if total_games else 0
+            pc_summary = " ".join(f"{k}p={v}" for k, v in sorted(games_by_pc.items()))
             print(f"[c_actor {actor_id}] {total_games} games, "
                   f"{shard_idx} shards, {gps:.2f} g/s, "
                   f"~{avg_s:.0f} steps/g, t={temp:.2f}, "
-                  f"wins={wins.tolist()}", flush=True)
+                  f"wins={wins.tolist()} | {pc_summary}", flush=True)
 
             # Write per-actor stats for the learner to aggregate
             stats_dir = os.path.join(ckpt_dir, ".actor_stats")
@@ -915,7 +926,7 @@ def _run_actors_only(args, weights_bin):
             args=(aid, weights_bin, args.shard_dir, args.ckpt_dir,
                   args.search_depth, seed_base, args.max_pending,
                   args.explore_setup, args.dirichlet_alpha,
-                  args.dirichlet_frac),
+                  args.dirichlet_frac, args.player_counts),
             daemon=True,
         )
         p.start()
@@ -968,7 +979,21 @@ def main():
                         help="Fraction of games with random setup exploration")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet-frac", type=float, default=0.25)
+    parser.add_argument("--player-counts", type=str, default="2,3,4",
+                        help="Comma-separated player counts to sample uniformly "
+                             "per game (e.g. '2,3,4' or '4').")
     args = parser.parse_args()
+    try:
+        args.player_counts = tuple(int(x) for x in args.player_counts.split(",")
+                                    if x.strip())
+    except ValueError:
+        parser.error(f"--player-counts must be comma-separated ints, "
+                     f"got: {args.player_counts}")
+    if not args.player_counts:
+        parser.error("--player-counts cannot be empty")
+    for n in args.player_counts:
+        if n not in (2, 3, 4):
+            parser.error(f"--player-counts values must be 2, 3 or 4 (got {n})")
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     os.makedirs(os.path.join(args.shard_dir, "pending"), exist_ok=True)
@@ -982,6 +1007,7 @@ def main():
     print(f"  C weights:   {weights_bin}", flush=True)
     print(f"  Shards:      {args.shard_dir}", flush=True)
     print(f"  Checkpoints: {args.ckpt_dir}", flush=True)
+    print(f"  Player cnts: {list(args.player_counts)} (uniform per game)", flush=True)
 
     # ── Actors-only mode ─────────────────────────────────────────
     if args.role == "actors":
@@ -1049,7 +1075,7 @@ def main():
             args=(aid, weights_bin, args.shard_dir, args.ckpt_dir,
                   args.search_depth, seed_base, args.max_pending,
                   args.explore_setup, args.dirichlet_alpha,
-                  args.dirichlet_frac),
+                  args.dirichlet_frac, args.player_counts),
             daemon=True,
         )
         p.start()

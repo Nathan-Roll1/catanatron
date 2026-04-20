@@ -43,9 +43,38 @@ def evaluate_search_vs_ab2(
     nn_opponent: use NN value head for opponent model instead of base_value_fn.
     """
     from hexzero.game.interface import CatanGame
-    from hexzero.bindings.structs import Game as CGame, Action, MAX_ACTIONS
+    from hexzero.bindings.structs import (
+        Game as CGame, Action, MAX_ACTIONS, SearchCtx, ValueFn,
+    )
 
     AD = 337
+    # SearchCtx + wrapped eval_fn for proper expectimax AB2 (matches Python
+    # catanatron's AlphaBetaPlayer(depth=2)). Reused across all decisions.
+    _ab_ctx = SearchCtx()
+    _ab_buf = (Action * MAX_ACTIONS)()
+    _ab_eval = ValueFn(lib.base_value_fn)
+
+    def _proper_ab2_choose(g, le, depth=2):
+        n = len(le)
+        if n == 0: return 0
+        if n == 1: return 0
+        cg = g._game
+        bc = cg.state.colors[cg.state.current_player_index]
+        for i, act in enumerate(le):
+            _ab_buf[i] = act
+        res = lib.alphabeta_search(
+            ctypes.byref(_ab_ctx), ctypes.byref(cg), _ab_buf,
+            ctypes.c_int(n), ctypes.c_int(depth),
+            ctypes.c_double(-1e30), ctypes.c_double(1e30),
+            ctypes.c_int(bc), _ab_eval,
+        )
+        chosen_bytes = ctypes.string_at(ctypes.byref(res.action),
+                                         ctypes.sizeof(res.action))
+        for i, act in enumerate(le):
+            if ctypes.string_at(ctypes.byref(act),
+                                ctypes.sizeof(act)) == chosen_bytes:
+                return i
+        return 0
     N, E = state_enc.num_nodes, state_enc.num_edges
     NF = state_enc.NODE_FEATURE_DIM
     EF = state_enc.EDGE_FEATURE_DIM
@@ -77,7 +106,8 @@ def evaluate_search_vs_ab2(
         if not active:
             break
 
-        # --- AB2 seats: 1-ply greedy on base_value_fn ---
+        # --- AB2 seats: proper alpha-beta minimax with chance-node
+        #     expectimax (matches Python catanatron AlphaBetaPlayer(depth=2)) ---
         progress = True
         while progress:
             progress = False
@@ -91,16 +121,7 @@ def evaluate_search_vs_ab2(
                 le = g.get_legal_actions()
                 if not le:
                     continue
-                cg = g._game
-                bc = cg.state.colors[cg.state.current_player_index]
-                bi, bv = 0, -1e30
-                for i, act in enumerate(le):
-                    lib.game_copy(ctypes.byref(ch), ctypes.byref(cg))
-                    lib.game_execute(ctypes.byref(ch), act, ca, ctypes.byref(cn))
-                    v = lib.base_value_fn(ctypes.byref(ch), bc)
-                    if v > bv:
-                        bv = v
-                        bi = i
+                bi = _proper_ab2_choose(g, le, depth=2)
                 g.step(bi)
                 progress = True
 
@@ -212,13 +233,15 @@ def _policy_sample(g, le, net, state_enc, action_enc, device,
     placement quality matters most.  Mid-game uses low temperature (0.05).
     """
     is_initial = g.turn_number <= 7
-    effective_temp = 0.01 if is_initial else min(temperature, 0.05)
+    effective_temp = 0.01 if is_initial else max(temperature, 1e-6)
 
     nf = np.zeros((1, N, NF), dtype=np.float32)
     ef = np.zeros((1, E, EF), dtype=np.float32)
     ff = np.zeros((1, FF), dtype=np.float32)
     state_enc.encode_into(g.get_state_view(), nf[0], ef[0], ff[0])
     mask_np = action_enc.get_action_mask(le).numpy()
+
+    use_argmax = (temperature < 0.001)
 
     with torch.no_grad():
         mask_t = torch.from_numpy(mask_np).unsqueeze(0).to(device)
@@ -232,12 +255,13 @@ def _policy_sample(g, le, net, state_enc, action_enc, device,
             "action_mask": mask_397,
         }
         out = net(batch)
-        lo = out["policy_logits"][:, :AD] / effective_temp
+        lo = out["policy_logits"][:, :AD]
         lo = lo.masked_fill(mask_t == 0, -1e9)
 
-        if is_initial:
+        if is_initial or use_argmax:
             aidx = int(lo.argmax(dim=-1).item())
         else:
+            lo = lo / effective_temp
             pr = F.softmax(lo, dim=-1).cpu().numpy()[0]
             if pr.sum() < 1e-6:
                 pr = mask_np / max(mask_np.sum(), 1e-8)

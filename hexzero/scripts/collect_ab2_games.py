@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Phase 1 data collection: AB2 vs AB2 games for supervised pretraining.
 
-Plays games where all 4 seats are AB2 (C heuristic bot), recording every
-move's state encoding, action mask, and chosen action. After each game,
+Plays games where every seat is AB2 (proper alpha-beta minimax with full
+chance-node expectimax — equivalent to Python catanatron's
+``AlphaBetaPlayer(depth=2)``). For each game, records every decision
+state's encoding, action mask, and chosen action. After each game,
 assigns graded rewards based on VP ranking (1.0 / 0.3 / 0.1 / 0.0).
+
+By default games are sampled uniformly from {2, 3, 4} player counts so
+the resulting model handles all variants. Pass ``--player-counts 4`` for
+4-player-only data.
 
 Saves concatenated tensors per file batch — directly loadable by a
 PyTorch Dataset without per-step dict overhead.
@@ -13,7 +19,8 @@ recording for offline supervised learning.
 
 Usage:
     python -m hexzero.scripts.collect_ab2_games \\
-        --output-dir data/ab2_games --num-games 2000 --num-workers 8
+        --output-dir data/ab2_games --num-games 2000 --num-workers 8 \\
+        --depth 2 --player-counts 2,3,4
 """
 
 from __future__ import annotations
@@ -36,67 +43,81 @@ MAX_STEPS = 2000
 
 # ── AB2 action selection ─────────────────────────────────────────────
 
-def _ab2_pick(cg, legal_actions, lib, child, child_acts, child_cnt,
-              depth=1, child2=None, child2_acts=None, child2_cnt=None):
-    """AB greedy: pick the action maximising base_value_fn.
 
-    depth=1: evaluate after one step (original AB2 behaviour).
-    depth=2: execute candidate, let next player greedily respond,
-             then evaluate from our perspective.
+def _ab2_pick(cg, legal_actions, lib, ctx, action_buf, eval_fn, depth=2):
+    """Proper alpha-beta minimax with full chance-node expectimax.
+
+    Calls into the strengthened ``alphabeta_search`` in ``csrc/search.c``,
+    which expands ROLL (11 dice outcomes), BUY_DEVELOPMENT_CARD (deck
+    composition), and MOVE_ROBBER-with-steal (5 resources) as chance
+    nodes — semantically equivalent to Python catanatron's
+    ``tree_search_utils.execute_spectrum``.
+
+    Returns the index of the chosen action within ``legal_actions``.
     """
+    n = len(legal_actions)
+    if n == 0:
+        return 0
+    if n == 1:
+        return 0
     bc = cg.state.colors[cg.state.current_player_index]
-    best_i, best_v = 0, -1e30
+
+    # Copy legal actions into a contiguous buffer (alphabeta_search may
+    # reorder them internally for move ordering).
     for i, act in enumerate(legal_actions):
-        lib.game_copy(ctypes.byref(child), ctypes.byref(cg))
-        lib.game_execute(ctypes.byref(child), act,
-                         child_acts, ctypes.byref(child_cnt))
-        if depth >= 2 and child_cnt.value > 0 \
-                and lib.game_winning_color(ctypes.byref(child)) < 0:
-            if child_cnt.value > 1:
-                bc2 = child.state.colors[child.state.current_player_index]
-                best_resp, best_rv = 0, -1e30
-                for j in range(child_cnt.value):
-                    lib.game_copy(ctypes.byref(child2), ctypes.byref(child))
-                    lib.game_execute(ctypes.byref(child2), child_acts[j],
-                                     child2_acts, ctypes.byref(child2_cnt))
-                    rv = lib.base_value_fn(ctypes.byref(child2), bc2)
-                    if rv > best_rv:
-                        best_rv = rv
-                        best_resp = j
-                lib.game_copy(ctypes.byref(child2), ctypes.byref(child))
-                lib.game_execute(ctypes.byref(child2), child_acts[best_resp],
-                                 child2_acts, ctypes.byref(child2_cnt))
-                v = lib.base_value_fn(ctypes.byref(child2), bc)
-            else:
-                lib.game_execute(ctypes.byref(child), child_acts[0],
-                                 child_acts, ctypes.byref(child_cnt))
-                v = lib.base_value_fn(ctypes.byref(child), bc)
-        else:
-            v = lib.base_value_fn(ctypes.byref(child), bc)
-        if v > best_v:
-            best_v = v
-            best_i = i
-    return best_i
+        action_buf[i] = act
+
+    res = lib.alphabeta_search(
+        ctypes.byref(ctx),
+        ctypes.byref(cg),
+        action_buf,
+        ctypes.c_int(n),
+        ctypes.c_int(depth),
+        ctypes.c_double(-1e30),
+        ctypes.c_double(1e30),
+        ctypes.c_int(bc),
+        eval_fn,
+    )
+
+    # Find the matching action in the original order. We compare by
+    # bytewise equality of the Action struct since that's what the C side
+    # produced.
+    chosen_bytes = ctypes.string_at(ctypes.byref(res.action),
+                                     ctypes.sizeof(res.action))
+    for i, act in enumerate(legal_actions):
+        if ctypes.string_at(ctypes.byref(act),
+                            ctypes.sizeof(act)) == chosen_bytes:
+            return i
+    return 0
 
 
 # ── Reward computation ────────────────────────────────────────────────
 
 def _compute_rewards(game) -> np.ndarray:
-    """Graded 4-player reward vector based on VP ranking."""
+    """Graded reward vector (always length 4 — pad unused seats with 0).
+
+    Works for 2/3/4-player games. The model's value head is fixed at 4
+    outputs; downstream training rotates so the current player is slot 0
+    and ignores trailing slots beyond ``num_players``.
+    """
     winner = game.winner()
     n_p = game.num_players
     vps = [game._game.state.player_state[i][0] for i in range(n_p)]
     ranked = sorted(range(n_p), key=lambda i: vps[i], reverse=True)
 
+    # Position-based grades: 1st/2nd/3rd/4th finishers
     if winner is None:
-        grade = {ranked[0]: 0.1, ranked[1]: 0.05,
-                 ranked[2]: 0.02, ranked[3]: 0.0}
+        ladder = [0.1, 0.05, 0.02, 0.0]
     else:
-        grade = {ranked[0]: 1.0, ranked[1]: 0.3,
-                 ranked[2]: 0.1, ranked[3]: 0.0}
+        ladder = [1.0, 0.3, 0.1, 0.0]
+    grade = {ranked[i]: ladder[i] for i in range(n_p)}
+    if winner is not None:
         grade[winner] = 1.0
 
-    return np.array([grade.get(p, 0.0) for p in range(4)], dtype=np.float32)
+    out = np.zeros(4, dtype=np.float32)
+    for p in range(n_p):
+        out[p] = grade.get(p, 0.0)
+    return out
 
 
 # ── Per-file serialisation ────────────────────────────────────────────
@@ -171,15 +192,21 @@ def _save_metadata(state_enc, output_dir):
 
 def _worker_fn(worker_id, num_games, output_dir, games_per_file,
                seed_base, counter, total_target, file_idx_start=0,
-               ab_depth=1):
+               ab_depth=2, player_counts=(2, 3, 4)):
     """Play *num_games* AB-only games, record every step, save batched .pt files."""
+    from hexzero.config import GameConfig
     from hexzero.game.interface import CatanGame
     from hexzero.encoder.action_encoder import ActionEncoder
     from hexzero.bindings.lib_loader import load_library
-    from hexzero.bindings.structs import Game as CGame, Action as CAction, MAX_ACTIONS
+    from hexzero.bindings.structs import (
+        Action as CAction, SearchCtx, ValueFn, MAX_ACTIONS,
+    )
 
     lib = load_library()
     action_enc = ActionEncoder()
+    # Wrap C base_value_fn into a CFUNCTYPE so ctypes accepts it as the
+    # eval_fn callback parameter to alphabeta_search.
+    eval_fn = ValueFn(lib.base_value_fn)
 
     tmp = CatanGame(seed=0)
     tmp.reset()
@@ -198,24 +225,28 @@ def _worker_fn(worker_id, num_games, output_dir, games_per_file,
     ef_buf = np.zeros((E, EF), dtype=np.float32)
     ff_buf = np.zeros(FF, dtype=np.float32)
 
-    child = CGame()
-    child_acts = (CAction * MAX_ACTIONS)()
-    child_cnt = ctypes.c_int(0)
-    child2 = CGame()
-    child2_acts = (CAction * MAX_ACTIONS)()
-    child2_cnt = ctypes.c_int(0)
+    # Single SearchCtx reused across all decisions in this worker.
+    ctx = SearchCtx()
+    action_buf = (CAction * MAX_ACTIONS)()
+
+    rng = np.random.default_rng(seed_base ^ 0xCAFE)
+    pc_arr = np.asarray(player_counts, dtype=np.int64)
 
     batch: list[tuple] = []
     file_idx = file_idx_start
     total_steps = 0
     wins = np.zeros(4, dtype=np.int64)
+    games_by_pc = {int(pc): 0 for pc in pc_arr}
     timeouts = 0
     t_start = time.time()
 
     for game_num in range(num_games):
         seed = seed_base + game_num
-        game = CatanGame(seed=seed)
+        n_players = int(rng.choice(pc_arr))
+        cfg = GameConfig(num_players=n_players)
+        game = CatanGame(seed=seed, random_board=True, config=cfg)
         game.reset()
+        games_by_pc[n_players] = games_by_pc.get(n_players, 0) + 1
 
         nf_list, ef_list, ff_list = [], [], []
         mask_list, act_list, player_list = [], [], []
@@ -231,12 +262,14 @@ def _worker_fn(worker_id, num_games, output_dir, games_per_file,
             state_enc.encode_into(sv, nf_buf, ef_buf, ff_buf)
             mask = action_enc.get_action_mask(le).numpy()
 
-            chosen = _ab2_pick(game._game, le, lib,
-                               child, child_acts, child_cnt,
-                               depth=ab_depth,
-                               child2=child2, child2_acts=child2_acts,
-                               child2_cnt=child2_cnt)
-            enc_idx = action_enc.encode(le[chosen])
+            chosen = _ab2_pick(game._game, le, lib, ctx, action_buf,
+                               eval_fn, depth=ab_depth)
+
+            try:
+                enc_idx = action_enc.encode(le[chosen])
+            except ValueError:
+                game.step(chosen)
+                continue
 
             nf_list.append(nf_buf.copy())
             ef_list.append(ef_buf.copy())
@@ -292,9 +325,10 @@ def _worker_fn(worker_id, num_games, output_dir, games_per_file,
     elapsed = time.time() - t_start
     files_written = file_idx - file_idx_start
     gps = num_games / elapsed if elapsed > 0 else 0
+    pc_summary = " ".join(f"{k}p={v}" for k, v in sorted(games_by_pc.items()))
     print(f"[worker {worker_id}] Done: {num_games} games, {total_steps:,} steps, "
           f"{files_written} files in {elapsed:.1f}s ({gps:.1f} g/s) | "
-          f"wins={wins.tolist()} timeouts={timeouts}",
+          f"wins={wins.tolist()} timeouts={timeouts} | counts: {pc_summary}",
           flush=True)
 
 
@@ -316,7 +350,21 @@ def main():
                         help="Base random seed (workers get non-overlapping ranges)")
     parser.add_argument("--depth", type=int, default=2,
                         help="AB search depth (1 = greedy, 2 = 2-ply lookahead)")
+    parser.add_argument("--player-counts", type=str, default="2,3,4",
+                        help="Comma-separated player counts to sample uniformly "
+                             "(e.g. '2,3,4' or '4'). Each game picks one at random.")
     args = parser.parse_args()
+    try:
+        args.player_counts = tuple(int(x) for x in args.player_counts.split(",")
+                                    if x.strip())
+    except ValueError:
+        parser.error(f"--player-counts must be comma-separated ints, "
+                     f"got: {args.player_counts}")
+    if not args.player_counts:
+        parser.error("--player-counts cannot be empty")
+    for n in args.player_counts:
+        if n not in (2, 3, 4):
+            parser.error(f"--player-counts values must be 2, 3 or 4 (got {n})")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -351,12 +399,14 @@ def main():
     seed_resume = args.seed + existing_games
 
     print(f"Phase 1 data collection: {args.num_games} AB2-only games")
-    print(f"  Existing:   {existing_games} games ({len(existing_shards)} shards)")
+    print(f"  Existing:    {existing_games} games ({len(existing_shards)} shards)")
     print(f"  To generate: {games_to_gen} games")
-    print(f"  Workers:    {args.num_workers}")
-    print(f"  Output:     {args.output_dir}")
-    print(f"  Games/file: {args.games_per_file}")
-    print(f"  Seed:       {seed_resume} (offset for resume)")
+    print(f"  Workers:     {args.num_workers}")
+    print(f"  Output:      {args.output_dir}")
+    print(f"  Games/file:  {args.games_per_file}")
+    print(f"  Seed:        {seed_resume} (offset for resume)")
+    print(f"  AB depth:    {args.depth} (proper alpha-beta + chance-node expectimax)")
+    print(f"  Player cnts: {list(args.player_counts)} (uniform per game)")
     print(flush=True)
 
     t0 = time.time()
@@ -365,7 +415,7 @@ def main():
         fstart = worker_max_file_idx.get(0, -1) + 1
         _worker_fn(0, games_to_gen, args.output_dir, args.games_per_file,
                    seed_resume, None, games_to_gen, file_idx_start=fstart,
-                   ab_depth=args.depth)
+                   ab_depth=args.depth, player_counts=args.player_counts)
     else:
         ctx = mp.get_context("spawn")
         counter = ctx.Value("i", 0)
@@ -384,7 +434,7 @@ def main():
                 target=_worker_fn,
                 args=(w, n, args.output_dir, args.games_per_file,
                       seed_resume + seed_offset, counter, games_to_gen,
-                      fstart, args.depth),
+                      fstart, args.depth, args.player_counts),
                 daemon=True,
             )
             p.start()

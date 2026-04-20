@@ -27,6 +27,7 @@ from hexzero.bindings.structs import (
     MAX_DEGREE,
     MAX_PLAYERS,
     NPLACE_OFFICIAL_SPIRAL,
+    NPLACE_RANDOM_BALANCED,
     NUM_LAND_TILES,
     NUM_PLAYER_STATE_FIELDS,
     NUM_RESOURCES,
@@ -63,6 +64,7 @@ class StateView:
     num_turns: int
     is_initial_build_phase: bool
     current_prompt: int
+    num_players: int
 
     player_state: np.ndarray  # (4, 29) int32
     buildings: np.ndarray  # (96,) int8 — packed color<<2|type, or -1
@@ -112,6 +114,7 @@ class CatanGame:
         "_action_count",
         "_num_players",
         "_config",
+        "_nplace",
     )
 
     def __init__(
@@ -119,6 +122,7 @@ class CatanGame:
         seed: int = 0,
         num_players: int = 4,
         config: GameConfig | None = None,
+        random_board: bool = False,
     ):
         self._lib: ctypes.CDLL = load_library()
         self._config = config or GameConfig(num_players=num_players)
@@ -127,13 +131,15 @@ class CatanGame:
         self._action_buf = _ActionArray()
         self._action_count = ctypes.c_int(0)
 
+        self._nplace = NPLACE_RANDOM_BALANCED if random_board else NPLACE_OFFICIAL_SPIRAL
+
         self._map_obj = CatanMap()
         rng = RngState()
         self._lib.rng_init(ctypes.byref(rng), ctypes.c_uint64(seed))
         self._lib.build_map(
             ctypes.byref(self._map_obj),
             MAP_BASE,
-            NPLACE_OFFICIAL_SPIRAL,
+            self._nplace,
             ctypes.byref(rng),
         )
         self._map_ptr = ctypes.pointer(self._map_obj)
@@ -188,7 +194,7 @@ class CatanGame:
             self._lib.build_map(
                 ctypes.byref(self._map_obj),
                 MAP_BASE,
-                NPLACE_OFFICIAL_SPIRAL,
+                self._nplace,
                 ctypes.byref(rng),
             )
             self._map_ptr = ctypes.pointer(self._map_obj)
@@ -323,6 +329,7 @@ class CatanGame:
             num_turns=state.num_turns,
             is_initial_build_phase=bool(state.is_initial_build_phase),
             current_prompt=int(state.current_prompt),
+            num_players=int(state.num_players),
             player_state=player_state,
             buildings=buildings,
             road_owners=road_owners,
@@ -367,6 +374,7 @@ class CatanGame:
             num_turns=state.num_turns,
             is_initial_build_phase=bool(state.is_initial_build_phase),
             current_prompt=int(state.current_prompt),
+            num_players=int(state.num_players),
             player_state=player_state,
             buildings=buildings,
             road_owners=road_owners,

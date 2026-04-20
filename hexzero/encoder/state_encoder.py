@@ -52,6 +52,7 @@ class StateView(Protocol):
     num_turns: int
     is_initial_build_phase: bool
     current_prompt: int
+    num_players: int
     player_state: np.ndarray      # (4, 29)
     buildings: np.ndarray          # (96,) int8
     road_owners: np.ndarray        # (96, 3) int8
@@ -294,23 +295,32 @@ class StateEncoder:
             ef[:, 1 + k] = rc_arr == (cp + k) % NUM_PLAYERS
 
         # ── flat features (115) ──────────────────────────────────────
-        rot = [(cp + i) % NUM_PLAYERS for i in range(NUM_PLAYERS)]
-        ps = state.player_state[rot].astype(np.float32)
+        # Rotate so the current player is always slot 0, then the other
+        # real seats follow in turn order. Unused trailing slots stay 0.
+        # Works for 2/3/4-player games — 2p has slots {0, 1} populated,
+        # 3p has {0, 1, 2}, 4p has all four.
+        n_real = int(getattr(state, "num_players", NUM_PLAYERS))
+        if n_real <= 0 or n_real > NUM_PLAYERS:
+            n_real = NUM_PLAYERS
+        rot_real = [(cp + i) % n_real for i in range(n_real)]
+        ps = state.player_state[rot_real].astype(np.float32)
 
         o = 0
         for p in range(NUM_PLAYERS):
-            flat[o] = ps[p, _VP] / 10.0
-            flat[o+1:o+6] = ps[p, _RES:_RES+5] / 19.0
-            flat[o+6:o+11] = ps[p, _DEV:_DEV+5] / 14.0
-            flat[o+11:o+16] = ps[p, _PLAYED:_PLAYED+5]
-            flat[o+16] = ps[p, _HAS_ROAD]
-            flat[o+17] = ps[p, _HAS_ARMY]
-            flat[o+18] = ps[p, _HAS_ROLLED]
-            flat[o+19] = ps[p, _HAS_PLAYED_DEV]
-            flat[o+20] = ps[p, _ROADS_AVAIL] / 15.0
-            flat[o+21] = ps[p, _SETT_AVAIL] / 5.0
-            flat[o+22] = ps[p, _CITIES_AVAIL] / 4.0
-            flat[o+23] = ps[p, _LONGEST_ROAD] / 15.0
+            if p < n_real:
+                flat[o] = ps[p, _VP] / 10.0
+                flat[o+1:o+6] = ps[p, _RES:_RES+5] / 19.0
+                flat[o+6:o+11] = ps[p, _DEV:_DEV+5] / 14.0
+                flat[o+11:o+16] = ps[p, _PLAYED:_PLAYED+5]
+                flat[o+16] = ps[p, _HAS_ROAD]
+                flat[o+17] = ps[p, _HAS_ARMY]
+                flat[o+18] = ps[p, _HAS_ROLLED]
+                flat[o+19] = ps[p, _HAS_PLAYED_DEV]
+                flat[o+20] = ps[p, _ROADS_AVAIL] / 15.0
+                flat[o+21] = ps[p, _SETT_AVAIL] / 5.0
+                flat[o+22] = ps[p, _CITIES_AVAIL] / 4.0
+                flat[o+23] = ps[p, _LONGEST_ROAD] / 15.0
+            # else: leave zeros for unused trailing seats
             o += _FEAT_PER_PLAYER
 
         o1 = NUM_PLAYERS * _FEAT_PER_PLAYER
