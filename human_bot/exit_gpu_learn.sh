@@ -30,10 +30,16 @@ flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
 : "${WANDB_NAME:=exit_gpu_v1}"
 
 mkdir -p "$CKPT_DIR" "$SHARD_DIR/pending"
-# Seed initial checkpoint if not already present
+# Seed initial checkpoint if not already present.
+# Also seed latest.pt so actors can pick up the bootstrap weights on startup
+# before the learner's first training round has produced a new checkpoint.
 if [ ! -f "$CKPT_DIR/init.pt" ]; then
     cp "$CKPT" "$CKPT_DIR/init.pt"
     echo "[launcher] Seeded $CKPT_DIR/init.pt from $CKPT"
+fi
+if [ ! -f "$CKPT_DIR/latest.pt" ]; then
+    cp "$CKPT" "$CKPT_DIR/latest.pt"
+    echo "[launcher] Seeded $CKPT_DIR/latest.pt from $CKPT (actors will start from this)"
 fi
 
 python3 -u human_bot/c_selfplay.py \

@@ -35,16 +35,31 @@ flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
 : "${TOP_K:=2}"
 : "${MAX_PENDING:=200}"
 : "${PLAYER_COUNTS:=2,3,4}"
-: "${CKPT:=checkpoints/ab2_imit_v1/latest.pt}"
+# Actors read the LIVE checkpoint that the ExIt learner exports so they
+# pick up policy improvements every reload_interval games.
+: "${CKPT:=checkpoints/exit_gpu_v1/latest.pt}"
 : "${SHARD_DIR:=data/exit_gpu_v1}"
 : "${CKPT_DIR:=checkpoints/exit_gpu_v1}"
 
 echo "[launcher] num_actors=$NUM_ACTORS num_gpus=$NUM_GPUS offset=$ACTOR_OFFSET"
 echo "[launcher] depth=$SEARCH_DEPTH top_k=$TOP_K max_pending=$MAX_PENDING"
-echo "[launcher] ckpt=$CKPT"
+echo "[launcher] ckpt=$CKPT (live from learner)"
 echo "[launcher] shard_dir=$SHARD_DIR  ckpt_dir=$CKPT_DIR"
 
 mkdir -p "$CKPT_DIR" "$SHARD_DIR/pending"
+
+# Wait briefly for the learner to seed checkpoint files (it does this on
+# launch). Actors should start AFTER the learner.
+echo "[launcher] Waiting up to 120s for $CKPT to exist..."
+for _ in $(seq 1 120); do
+    [ -f "$CKPT" ] && break
+    sleep 1
+done
+if [ ! -f "$CKPT" ]; then
+    echo "[launcher] ERROR: $CKPT never appeared. Is the learner running?" >&2
+    exit 1
+fi
+echo "[launcher] Found $CKPT, proceeding."
 
 python3 -u human_bot/exit_gpu_actors.py \
     --checkpoint "$CKPT" \
