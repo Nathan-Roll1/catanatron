@@ -13,6 +13,13 @@ set -euo pipefail
 cd /nlp/scr/nroll/catan_training_big
 export PYTHONPATH=$PWD:$PYTHONPATH
 
+# Rebuild libcatan for this node's CPU (-march=native was built elsewhere
+# → "Illegal instruction" on jag nodes with different SIMD support).
+# flock serializes concurrent rebuilds across jobs sharing the repo.
+echo "[launcher] Rebuilding libcatan on $(hostname)..."
+flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
+    python3 -m hexzero.bindings.build_lib
+
 : "${NUM_WORKERS:=40}"
 : "${ACTOR_OFFSET:=0}"
 : "${MAX_PENDING:=200}"

@@ -14,6 +14,13 @@ export TRUNK_CHANNELS=192
 : "${WANDB_API_KEY:=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}"
 export WANDB_API_KEY
 
+# Rebuild libcatan for this node's CPU (-march=native was built elsewhere
+# → "Illegal instruction" on jag nodes with different SIMD support).
+# flock serializes concurrent rebuilds across jobs sharing the repo.
+echo "[launcher] Rebuilding libcatan on $(hostname)..."
+flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
+    python3 -m hexzero.bindings.build_lib
+
 python3 -u human_bot/c_selfplay.py \
     --role learner \
     --checkpoint checkpoints/ab2_imit_v1/init.pt \
