@@ -6,6 +6,7 @@
 #include "state.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int action_order(ActionType t) {
