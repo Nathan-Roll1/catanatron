@@ -16,6 +16,13 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export GNN_HIDDEN=80
 export TRUNK_CHANNELS=192
 
+# PyTorch / MKL stability on jag nodes: avoid AVX-mismatch SIGILL crashes
+export MKL_SERVICE_FORCE_INTEL=1
+export MKL_THREADING_LAYER=GNU
+export OMP_NUM_THREADS=4
+# Keep CUDA on the first GPU SLURM gives us
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
 # W&B (same key as ab2_imit_learn.sh)
 : "${WANDB_API_KEY:=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}"
 export WANDB_API_KEY

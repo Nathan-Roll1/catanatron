@@ -24,6 +24,12 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export GNN_HIDDEN=80
 export TRUNK_CHANNELS=192
 
+# PyTorch / MKL stability on jag nodes
+export MKL_SERVICE_FORCE_INTEL=1
+export MKL_THREADING_LAYER=GNU
+export OMP_NUM_THREADS=2
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
 echo "[launcher] Rebuilding libcatan on $(hostname)..."
 flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \
     python3 -m hexzero.bindings.build_lib
