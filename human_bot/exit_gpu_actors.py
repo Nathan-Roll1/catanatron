@@ -281,17 +281,19 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     # ── ABt search (NN policy + argmax rollout + AB2 leaf) ──────────
     def abt_search(game, le, depth, temperature):
         """For each top-k candidate, run depth-N argmax rollout, score with
-        AB2 leaf, sample with temperature.
+        AB2 leaf. Returns (target_action, played_action):
+          - target_action = SEARCH ARGMAX (the search-improved best move; what
+            we want the policy to learn, regardless of exploration).
+          - played_action = temperature-sampled (gives game-trajectory
+            exploration so we don't always replay the same game).
 
         Candidates' rollouts run in lockstep — one batched NN forward per
-        ply across all live candidate clones. Cuts per-decision NN calls
-        from `top_k * (depth-1)` sequential to `(depth-1)` batched.
+        ply across all live candidate clones.
         """
         seat = game.current_player()
         cands = policy_top_k(game, le, top_k)
         K = len(cands)
 
-        # Initialise candidate clones
         clones = [game.clone() for _ in range(K)]
         alive = [True] * K
         for p, ci in enumerate(cands):
@@ -302,7 +304,6 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             except Exception:
                 alive[p] = False
 
-        # Lockstep argmax rollout, batched across alive clones
         for ply in range(2, depth + 1):
             live = [p for p, a in enumerate(alive) if a]
             if not live:
@@ -323,7 +324,6 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
                 if gc.is_terminal() or gc.turn_number >= MAX_TURNS:
                     alive[p] = False
 
-        # Leaf evaluation
         values = np.zeros(K, dtype=np.float32)
         for p in range(K):
             gc = clones[p]
@@ -336,16 +336,21 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             v = apply_action_bonus(v, le[cands[p]])
             values[p] = v
 
-        # Temperature-sampled selection over top candidates
+        # Search argmax → training target (consistent across games)
+        argmax_p = int(np.argmax(values))
+        target_action = fix_robber_steal(cands[argmax_p], le)
+
+        # Temperature-sampled → played (game-trajectory exploration)
         if K == 1 or temperature < 0.01:
-            best_p = int(np.argmax(values))
+            played_p = argmax_p
         else:
             shifted = values - values.max()
             probs = np.exp(shifted / temperature)
             probs /= probs.sum()
-            best_p = int(np.random.choice(K, p=probs))
-        chosen = cands[best_p]
-        return fix_robber_steal(chosen, le)
+            played_p = int(np.random.choice(K, p=probs))
+        played_action = fix_robber_steal(cands[played_p], le)
+
+        return target_action, played_action
 
     # ── Per-game state container ────────────────────────────────────
     class GameSlot:
@@ -378,21 +383,24 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             se.encode_into(sv, nf, ef, ff)
             mask = ae.get_action_mask(le).numpy()
 
+            target_action = None  # search-improved target (recorded)
             if len(le) == 1:
-                chosen = 0
+                played = 0
             elif g.turn_number <= 7:
-                # Early turns (initial placement, first roll): policy argmax,
-                # search adds little here and is wasteful
-                chosen = nn_argmax_one(g)
-                if chosen is None:
-                    chosen = 0
+                played = nn_argmax_one(g)
+                if played is None:
+                    played = 0
+                target_action = played  # no search → policy argmax IS target
             else:
-                chosen = abt_search(g, le, search_depth, temperature)
+                target_action, played = abt_search(g, le, search_depth, temperature)
 
+            # Record TARGET (search argmax), not played action — this is the
+            # ExIt training signal: model learns search's preference.
+            recorded = target_action if target_action is not None else played
             try:
-                enc_action = ae.encode(le[chosen])
+                enc_action = ae.encode(le[recorded])
             except ValueError:
-                g.step(chosen)
+                g.step(played)
                 continue
 
             if len(le) > 1:
@@ -402,7 +410,7 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
                     "action_idx": enc_action,
                     "player": g.current_player(),
                 })
-            g.step(chosen)
+            g.step(played)
 
         winner = g.winner()
         reward_vec = np.zeros(4, dtype=np.float32)

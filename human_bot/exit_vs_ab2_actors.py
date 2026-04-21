@@ -283,6 +283,9 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
 
     # ── ExIt search (NN policy + batched argmax rollout + AB2 leaf) ──
     def abt_search(game, le, depth, temperature):
+        """Returns (target_action, played_action). Target = search argmax
+        (consistent training signal). Played = temperature-sampled (game
+        exploration). See exit_gpu_actors.py for rationale."""
         seat = game.current_player()
         cands = policy_top_k(game, le, top_k)
         K = len(cands)
@@ -322,15 +325,19 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             v = apply_action_bonus(v, le[cands[p]])
             values[p] = v
 
+        argmax_p = int(np.argmax(values))
+        target_action = fix_robber_steal(cands[argmax_p], le)
+
         if K == 1 or temperature < 0.01:
-            best_p = int(np.argmax(values))
+            played_p = argmax_p
         else:
             shifted = values - values.max()
             probs = np.exp(shifted / temperature)
             probs /= probs.sum()
-            best_p = int(np.random.choice(K, p=probs))
-        chosen = cands[best_p]
-        return fix_robber_steal(chosen, le)
+            played_p = int(np.random.choice(K, p=probs))
+        played_action = fix_robber_steal(cands[played_p], le)
+
+        return target_action, played_action
 
     # ── Play one asymmetric game; record NN's decisions only ─────────
     def play_one_game(seed, n_players, nn_seat, temperature):
@@ -361,18 +368,21 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             se.encode_into(sv, nf, ef, ff)
             mask = ae.get_action_mask(le).numpy()
 
+            target_action = None
             if len(le) == 1:
-                chosen = 0
+                played = 0
             elif game.turn_number <= 7:
-                chosen = nn_argmax_one(game)
-                if chosen is None: chosen = 0
+                played = nn_argmax_one(game)
+                if played is None: played = 0
+                target_action = played
             else:
-                chosen = abt_search(game, le, search_depth, temperature)
+                target_action, played = abt_search(game, le, search_depth, temperature)
 
+            recorded = target_action if target_action is not None else played
             try:
-                enc_action = ae.encode(le[chosen])
+                enc_action = ae.encode(le[recorded])
             except ValueError:
-                game.step(chosen)
+                game.step(played)
                 continue
 
             if len(le) > 1:
@@ -382,7 +392,7 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
                     "action_idx": enc_action,
                     "player": cp,
                 })
-            game.step(chosen)
+            game.step(played)
 
         winner = game.winner()
         reward_vec = np.zeros(4, dtype=np.float32)
