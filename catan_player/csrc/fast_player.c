@@ -31,6 +31,10 @@
 #include "actions.h"
 #include "value.h"
 #include "catan_types.h"
+#include "state_encode.h"
+#include "policy_topk.h"
+#include "deep_search.h"
+#include "board.h"
 
 static const float DICE_PROB[13] = {
     0, 0,
@@ -466,6 +470,107 @@ static int ab2_choose(Game *g, Action *le, int n_le) {
 }
 
 
+/* ── Super M2: deep recursive search with policy pruning ───────── */
+/*
+ * 4p_super_m2 setup:
+ *   our_depth = 6
+ *   k_schedule = [12, 8, 6, 5, 4, 3]
+ *   AB-leaf evaluation
+ *   AB2 opponent simulation inside rollouts
+ *   Pure C inner loop (no Python in tight loop)
+ */
+
+typedef struct {
+    DeepSearchCtx *ctx;
+    StateEncoderC enc;
+    bool initialized;
+    int our_depth;
+    int k_schedule[8];
+    int schedule_len;
+    int opp_ab_depth;
+    double time_budget_sec;
+} SuperM2;
+
+static void super_m2_init(SuperM2 *sm, NNModel *model, Game *g0) {
+    sm->our_depth = 6;
+    int sched[6] = {12, 8, 6, 5, 4, 3};
+    memcpy(sm->k_schedule, sched, sizeof(sched));
+    sm->schedule_len = 6;
+    sm->opp_ab_depth = 2;
+    sm->time_budget_sec = 4.0;
+
+    state_encoder_init(&sm->enc, g0, 4);
+
+    /* Leaf cache: 1<<20 entries = 1M buckets */
+    sm->ctx = deep_search_create_c(20, model, &sm->enc);
+    if (!sm->ctx) {
+        fprintf(stderr, "deep_search_create_c failed\n");
+        exit(1);
+    }
+
+    deep_search_configure(sm->ctx, sm->our_depth,
+                          sm->k_schedule, sm->schedule_len,
+                          sm->opp_ab_depth, sm->time_budget_sec);
+    sm->initialized = true;
+}
+
+static void super_m2_destroy(SuperM2 *sm) {
+    if (sm->ctx) {
+        deep_search_destroy(sm->ctx);
+        sm->ctx = NULL;
+    }
+    sm->initialized = false;
+}
+
+/* Pick a move using deep_search. Returns index into le[0..n_le-1]. */
+static int super_m2_choose(SuperM2 *sm, NNModel *model, Game *g,
+                           Action *le, int n_le,
+                           float nf_buf[NN_NODES][NN_NODE_FEAT],
+                           float ef_buf[NN_MAX_EDGES][NN_EDGE_FEAT],
+                           float ff_buf[NN_FLAT_DIM],
+                           float mk_buf[NN_MASK_DIM]) {
+    if (n_le <= 1) return 0;
+
+    int seat = g->state.current_player_index;
+    Color seat_color = g->state.colors[seat];
+
+    /* Terminal-winning move shortcut */
+    for (int i = 0; i < n_le; i++) {
+        Game test;
+        game_copy(&test, g);
+        Action tmp[MAX_ACTIONS];
+        int tn;
+        game_execute(&test, le[i], tmp, &tn);
+        if (game_winning_color(&test) == seat_color) {
+            return i;
+        }
+    }
+
+    /* Get top-K root candidates via policy */
+    int k_root = sm->k_schedule[0];
+    if (k_root > n_le) k_root = n_le;
+
+    int top_indices[16];
+    /* Use a single 4+MASK_DIM scratch buffer for policy_top_k */
+    static float policy_out_buf[4 + NN_MASK_DIM];
+    int n_top = policy_top_k(&sm->enc, model, g, le, n_le, k_root,
+                              top_indices,
+                              (float *)nf_buf, (float *)ef_buf, ff_buf,
+                              mk_buf, policy_out_buf);
+    if (n_top <= 0) return 0;
+
+    /* Run deep recursive search on those candidates */
+    int best_idx_out = -1;
+    deep_search_root(sm->ctx, g, seat_color,
+                     top_indices, n_top, &best_idx_out);
+
+    int best_pi = (best_idx_out >= 0 && best_idx_out < n_top)
+                  ? best_idx_out : 0;
+    int chosen = top_indices[best_pi];
+    return fix_robber_steal(chosen, le, n_le);
+}
+
+
 /* ── Main ───────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
@@ -476,6 +581,7 @@ int main(int argc, char **argv) {
     bool verbose = false;
     int mode = 0;  /* 0=selfplay, 1=2v2, 2=1v3, 3=ab2-only */
     int ab_depth = 2;
+    bool use_super_m2 = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
@@ -496,6 +602,8 @@ int main(int argc, char **argv) {
             mode = 3;
         else if (strcmp(argv[i], "--ab-depth") == 0 && i+1 < argc)
             ab_depth = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--super-m2") == 0)
+            use_super_m2 = true;
         else if (argv[i][0] != '-')
             seed_base = (uint64_t)atoll(argv[i]);
     }
@@ -530,6 +638,9 @@ int main(int argc, char **argv) {
     int wins[4] = {0};
     int total_turns = 0;
 
+    /* SuperM2 setup (lazy-initialized after first game's map is built) */
+    SuperM2 sm = {0};
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -556,6 +667,11 @@ int main(int argc, char **argv) {
         game_init_with_map(&g, &map, 4, colors, seed, 7, false, 10);
         int decisions = 0;
 
+        /* Initialize SuperM2 once (uses the game's map for STATIC_ADJ + encoder tables) */
+        if (use_super_m2 && !sm.initialized) {
+            super_m2_init(&sm, model, &g);
+        }
+
         while (game_winning_color(&g) == COLOR_NONE && g.state.num_turns < 1000) {
             int n_act = generate_playable_actions(&g.state, actions, MAX_ACTIONS);
             if (n_act == 0) break;
@@ -572,6 +688,16 @@ int main(int argc, char **argv) {
             } else if (mode > 0 && !nn_seat[cp]) {
                 chosen = ab_choose(&g, actions, n_act, ab_depth);
                 decisions++;
+            } else if (use_super_m2) {
+                chosen = super_m2_choose(&sm, model, &g, actions, n_act,
+                                          nf, ef, ff, mk);
+                decisions++;
+                if (verbose || is_interesting(actions[chosen].type)) {
+                    char buf[128];
+                    format_action(buf, sizeof(buf), actions[chosen]);
+                    printf("  T%3d P%d %s [super-m2]\n",
+                           g.state.num_turns, cp, buf);
+                }
             } else if (search_depth == 0) {
                 /* Pure policy argmax — no search */
                 encode_state(&g, model, nf, ef, ff);
@@ -617,7 +743,10 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
             printf("\n=============================================\n");
-            printf("  Search: ABt%d (top-%d)\n", search_depth, top_k);
+            if (use_super_m2)
+                printf("  Search: 4p_super_m2 (depth=6, k=12,8,6,5,4,3)\n");
+            else
+                printf("  Search: ABt%d (top-%d)\n", search_depth, top_k);
             printf("  Seed:   %llu\n", (unsigned long long)seed);
             printf("  Winner: Player %d\n",
                    winner != COLOR_NONE ? g.state.color_to_index[winner] : -1);
@@ -650,6 +779,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    super_m2_destroy(&sm);
     free(nf); free(ef); free(ff); free(mk); free(actions); free(model);
     return 0;
 }

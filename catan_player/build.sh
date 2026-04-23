@@ -36,6 +36,7 @@ fi
 
 SRCS="fast_player.c nn.c rng.c map.c board.c state.c actions.c"
 SRCS="$SRCS apply_action.c game.c value.c search.c"
+SRCS="$SRCS state_encode.c policy_topk.c deep_search.c"
 
 SRC_PATHS=""
 for s in $SRCS; do SRC_PATHS="$SRC_PATHS $CSRC/$s"; done

@@ -10,6 +10,35 @@ policy and hand-crafted value function. No Python, no external dependencies.
 ./catan_player
 ```
 
+## 4p_super_m2 — strongest setup
+
+Deep recursive minimax search with neural-network policy pruning at every
+one of our turns, AB2 opponent simulation in rollouts, and AB-leaf
+evaluation. Achieved **10/10 wins (100% WR)** vs 3 AB2 opponents in 1v3
+benchmark testing on seeds 95000-95009.
+
+```bash
+# 1v3: 1 NN with super_m2 vs 3 AB2 opponents
+./catan_player --games 10 --1v3 --super-m2 --seed 95000
+
+# 2v2: 2 NN with super_m2 vs 2 AB2 opponents
+./catan_player --games 10 --vs-ab2 --super-m2 --seed 95000
+
+# Verbose play-by-play
+./catan_player --games 1 --1v3 --super-m2 --verbose --seed 95000
+```
+
+**Configuration (hardcoded for super_m2):**
+- `our_depth = 6` — branch at our turns up to 6 deep
+- `k_schedule = [12, 8, 6, 5, 4, 3]` — policy top-K at depths 0..5
+- `opp_ab_depth = 2` — opponents simulated as full AB2 with chance nodes
+- `time_budget_sec = 4.0` per decision
+- `leaf_cache_bits = 20` — 1M-entry leaf eval cache
+
+Per-game wall time: ~75-85s on M5 Max single core. The pure-C inner loop
+(no Python) is the key — see `csrc/deep_search.c`, `csrc/state_encode.c`,
+and `csrc/policy_topk.c`.
+
 ## NN vs AB2 Evaluation
 
 The neural network (0-ply policy argmax) vs AB2 (2-ply alpha-beta with full
@@ -121,8 +150,9 @@ buildable nodes, longest road, dev cards, and army size.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--seed` | 42 | Random seed |
-| `--depth` | 30 | NN search depth (0 = policy argmax only) |
-| `--top-k` | 5 | NN candidates at root for search |
+| `--depth` | 30 | NN search depth (0 = policy argmax only); ignored with --super-m2 |
+| `--top-k` | 5 | NN candidates at root for search; ignored with --super-m2 |
+| `--super-m2` | off | Use 4p_super_m2: deep recursive search with policy pruning (overrides --depth/--top-k) |
 | `--games` | 1 | Number of games |
 | `--vs-ab2` | off | 2v2: NN seats vs AB2 seats with rotation |
 | `--1v3` | off | 1v3: 1 NN seat vs 3 AB2 seats with rotation |
