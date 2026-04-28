@@ -56,6 +56,10 @@ void deep_search_configure(DeepSearchCtx *ctx,
                            int opponent_ab_depth,
                            double time_budget_sec);
 
+/* Use the built-in hand-coded no-ML policy for move ordering. H-S sets this
+ * on and keeps the leaf evaluator as base_value_fn. */
+void deep_search_set_algo_policy(DeepSearchCtx *ctx, int enabled);
+
 /* Run search from `game` for `our_color`. Returns value in [-1, 1].
  * On entry, `game` should be at our turn; if not, the search will fast-forward.
  * `out_best_action_index` is filled with the index into `root_candidates`

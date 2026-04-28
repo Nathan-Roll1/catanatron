@@ -1,264 +1,66 @@
 /*
- * fast_player.c — Pure C Catan player: NN policy + AB2 value search.
- *
- * ABt30 search: neural network policy selects top-5 candidates, each is
- * rolled out 30 plies with policy argmax, then base_value_fn scores the leaf.
- *
- * Build:
- *   cc -O3 -march=native -flto -Icsrc csrc/fast_player.c csrc/nn.c \
- *      csrc/rng.c csrc/map.c csrc/board.c csrc/state.c csrc/actions.c \
- *      csrc/apply_action.c csrc/game.c csrc/value.c csrc/search.c \
- *      -o catan_player -lm [-framework Accelerate]
- *
- * Usage:
- *   ./catan_player                      # default: ABt30, seed 42
- *   ./catan_player --seed 777           # custom seed
- *   ./catan_player --depth 20           # shallower search
- *   ./catan_player --games 100          # multi-game benchmark
- *   ./catan_player --verbose            # print every action
+ * fast_player.c -- minimal standalone C runner for two agents:
+ *   - m2_0ply: M2 neural policy argmax, no search
+ *   - H-S: strongest validated no-ML heuristic search bot
  */
 
+#include <libgen.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include <time.h>
-#include <stdbool.h>
-#include <libgen.h>
 
-#include "nn.h"
-#include "game.h"
 #include "actions.h"
-#include "value.h"
-#include "catan_types.h"
-#include "state_encode.h"
-#include "policy_topk.h"
-#include "deep_search.h"
 #include "board.h"
+#include "catan_types.h"
+#include "deep_search.h"
+#include "game.h"
+#include "map.h"
+#include "nn.h"
+#include "policy_topk.h"
+#include "state_encode.h"
 
-static const float DICE_PROB[13] = {
-    0, 0,
-    1.0f/36, 2.0f/36, 3.0f/36, 4.0f/36, 5.0f/36, 6.0f/36,
-    5.0f/36, 4.0f/36, 3.0f/36, 2.0f/36, 1.0f/36
-};
+typedef enum {
+    AGENT_M2_0PLY = 0,
+    AGENT_HS = 1,
+} AgentKind;
 
-static const char *RES_NAMES[5] = {"Wood", "Brick", "Sheep", "Wheat", "Ore"};
+typedef struct {
+    AgentKind kind;
+    DeepSearchCtx *leaf_ctx;
+    float nf[ENC_NUM_NODES * ENC_NODE_FEAT_DIM];
+    float ef[ENC_NUM_EDGES * ENC_EDGE_FEAT_DIM];
+    float ff[ENC_FLAT_FEAT_DIM];
+    float mk[NN_MASK_DIM];
+    float out[4 + NN_MASK_DIM];
+} AgentRuntime;
 
-/*
- * Action index layout (337 total, must match Python ActionEncoder):
- *   0       ROLL
- *   1       END_TURN
- *   2       BUY_DEV
- *   3       KNIGHT
- *   4       ROAD_BUILDING
- *   5-58    SETTLEMENT (54 compact nodes)
- *   59-112  CITY (54 compact nodes)
- *   113-184 ROAD (72 edges)
- *   185-279 MOVE_ROBBER (19 tiles x 5: slots 0-3=steal player, 4=no steal)
- *   280-284 DISCARD (5 resources)
- *   285-304 YEAR_OF_PLENTY (15 ordered pairs + 5 half-picks)
- *   305-309 MONOPOLY (5 resources)
- *   310-329 MARITIME (20 give/receive pairs)
- *   330-336 Trade accept/reject/cancel/confirm (unused by policy)
- */
+static const int HS_DEPTH = 5;
+static const int HS_K[5] = {6, 4, 2, 2, 2};
+static const int HS_OPP_AB_DEPTH = 2;
+static const int HS_CACHE_BITS = 20;
 
-/* YoP pair LUT: (r1,r2) with r1<=r2 -> pair index 0-14 */
-static const int YOP_LUT[5][5] = {
-    { 0,  1,  2,  3,  4},
-    { 1,  5,  6,  7,  8},
-    { 2,  6,  9, 10, 11},
-    { 3,  7, 10, 12, 13},
-    { 4,  8, 11, 13, 14},
-};
-
-#define FEAT_PER_PLAYER 24
-#define FEAT_BANK       6
-#define FEAT_PHASE      13
-#define AD              337
-
-
-/* ── State Encoding ─────────────────────────────────────────────── */
-
-static void encode_state(const Game *g, const NNModel *m,
-                         float nf[NN_NODES][NN_NODE_FEAT],
-                         float ef[NN_MAX_EDGES][NN_EDGE_FEAT],
-                         float ff[NN_FLAT_DIM]) {
-    const State *s = &g->state;
-    int cp = s->current_player_index;
-
-    memset(nf, 0, sizeof(float) * NN_NODES * NN_NODE_FEAT);
-    memset(ef, 0, sizeof(float) * NN_MAX_EDGES * NN_EDGE_FEAT);
-    memset(ff, 0, sizeof(float) * NN_FLAT_DIM);
-
-    for (int i = 0; i < NN_NODES; i++) {
-        int gid = m->land_nodes[i];
-        int8_t bld = s->board.buildings[gid];
-        if (bld >= 0) {
-            int color = bld >> 2, type = bld & 0x3;
-            int seat = s->color_to_index[color];
-            int own = (seat == cp);
-            if (own && type == 0)       nf[i][1] = 1.0f;
-            else if (own && type == 1)  nf[i][2] = 1.0f;
-            else if (!own && type == 0) nf[i][3] = 1.0f;
-            else if (!own && type == 1) nf[i][4] = 1.0f;
-        } else {
-            nf[i][0] = 1.0f;
-        }
-    }
-
-    for (int ti = 0; ti < 19; ti++) {
-        int res = s->board.map->land_tiles[ti].resource;
-        int num = s->board.map->land_tiles[ti].number;
-        if (res < 0 || num <= 0 || num > 12) continue;
-        float prob = DICE_PROB[num];
-        for (int ni = 0; ni < 6; ni++) {
-            int lid = m->node_to_compact[m->tile_nodes[ti][ni]];
-            if (lid >= 0 && lid < NN_NODES)
-                nf[lid][5 + res] += prob;
-        }
-    }
-
-    for (int i = 0; i < NN_NODES; i++) nf[i][10] = 1.0f;
-    for (int pi = 0; pi < s->board.map->num_ports; pi++) {
-        const Port *port = &s->board.map->ports[pi];
-        int ptype = (port->resource < 0) ? 5 : port->resource;
-        for (int ni = 0; ni < 6; ni++) {
-            int lid = m->node_to_compact[port->nodes[ni]];
-            if (lid >= 0 && lid < NN_NODES) {
-                nf[lid][10] = 0.0f;
-                nf[lid][11 + ptype] = 1.0f;
-            }
-        }
-    }
-
-    Coordinate rc = s->board.robber_coordinate;
-    for (int ti = 0; ti < 19; ti++) {
-        Coordinate tc = s->board.map->land_tile_coords[ti];
-        if (tc.x == rc.x && tc.y == rc.y && tc.z == rc.z) {
-            for (int ni = 0; ni < 6; ni++) {
-                int lid = m->node_to_compact[m->tile_nodes[ti][ni]];
-                if (lid >= 0 && lid < NN_NODES) nf[lid][17] = 1.0f;
-            }
-            break;
-        }
-    }
-
-    int ne = m->num_edges;
-    for (int e = 0; e < ne; e++) {
-        int src_g = m->land_nodes[m->edge_src[e]];
-        int dst_g = m->land_nodes[m->edge_dst[e]];
-        int adj_idx = -1;
-        for (int j = 0; j < MAX_DEGREE; j++)
-            if (STATIC_ADJ[src_g][j] == dst_g) { adj_idx = j; break; }
-        if (adj_idx < 0) { ef[e][0] = 1.0f; continue; }
-        int8_t ro = s->board.road_owner[src_g][adj_idx];
-        if (ro < 0) {
-            ef[e][0] = 1.0f;
-        } else {
-            int seat = s->color_to_index[(int)ro];
-            if (seat == cp) ef[e][1] = 1.0f;
-            else ef[e][1 + ((seat - cp + 4) % 4)] = 1.0f;
-        }
-    }
-
-    int o = 0;
-    for (int p = 0; p < 4; p++) {
-        int seat = (cp + p) % 4;
-        const int *ps = s->player_state[seat];
-        ff[o]    = ps[PS_VICTORY_POINTS] / 10.0f;
-        for (int r = 0; r < 5; r++) ff[o+1+r] = ps[PS_WOOD_IN_HAND+r] / 19.0f;
-        for (int d = 0; d < 5; d++) ff[o+6+d] = ps[PS_KNIGHT_IN_HAND+d] / 14.0f;
-        for (int d = 0; d < 5; d++) ff[o+11+d] = (float)ps[PS_PLAYED_KNIGHT+d];
-        ff[o+16] = (float)ps[PS_HAS_ROAD];
-        ff[o+17] = (float)ps[PS_HAS_ARMY];
-        ff[o+18] = (float)ps[PS_HAS_ROLLED];
-        ff[o+19] = (float)ps[PS_HAS_PLAYED_DEV_CARD_IN_TURN];
-        ff[o+20] = ps[PS_ROADS_AVAILABLE] / 15.0f;
-        ff[o+21] = ps[PS_SETTLEMENTS_AVAILABLE] / 5.0f;
-        ff[o+22] = ps[PS_CITIES_AVAILABLE] / 4.0f;
-        ff[o+23] = ps[PS_LONGEST_ROAD_LENGTH] / 15.0f;
-        o += FEAT_PER_PLAYER;
-    }
-
-    int o1 = 4 * FEAT_PER_PLAYER;
-    for (int r = 0; r < 5; r++) ff[o1+r] = s->resource_freqdeck[r] / 19.0f;
-    ff[o1+5] = s->dev_deck_size / 25.0f;
-
-    int o2 = o1 + FEAT_BANK;
-    if (s->current_prompt >= 0 && s->current_prompt < 7)
-        ff[o2 + s->current_prompt] = 1.0f;
-    ff[o2+7]  = s->is_initial_build_phase ? 1.0f : 0.0f;
-    ff[o2+8]  = s->is_discarding ? 1.0f : 0.0f;
-    ff[o2+9]  = s->is_road_building ? 1.0f : 0.0f;
-    ff[o2+10] = s->is_moving_knight ? 1.0f : 0.0f;
-    ff[o2+11] = s->is_resolving_trade ? 1.0f : 0.0f;
-    ff[o2+12] = s->num_turns / 1000.0f;
+static const char *agent_name(AgentKind k) {
+    return k == AGENT_M2_0PLY ? "m2_0ply" : "H-S";
 }
 
-
-/* ── Action Encoding (must match Python ActionEncoder) ──────────── */
-
-static int action_to_idx(const NNModel *m, Action a) {
-    switch (a.type) {
-    case AT_ROLL:                return 0;
-    case AT_END_TURN:            return 1;
-    case AT_BUY_DEVELOPMENT_CARD: return 2;
-    case AT_PLAY_KNIGHT_CARD:    return 3;
-    case AT_PLAY_ROAD_BUILDING:  return 4;
-    case AT_BUILD_SETTLEMENT: {
-        int lid = m->node_to_compact[a.value[0]];
-        return (lid >= 0) ? 5 + lid : -1;
+static bool parse_agent(const char *s, AgentKind *out) {
+    if (strcmp(s, "m2_0ply") == 0 || strcmp(s, "m2") == 0 || strcmp(s, "policy") == 0) {
+        *out = AGENT_M2_0PLY;
+        return true;
     }
-    case AT_BUILD_CITY: {
-        int lid = m->node_to_compact[a.value[0]];
-        return (lid >= 0) ? 59 + lid : -1;
+    if (strcmp(s, "H-S") == 0 || strcmp(s, "h-s") == 0 ||
+        strcmp(s, "hs") == 0 || strcmp(s, "heuristic") == 0 ||
+        strcmp(s, "leaf0_search") == 0 || strcmp(s, "leaf0") == 0 ||
+        strcmp(s, "search") == 0) {
+        *out = AGENT_HS;
+        return true;
     }
-    case AT_BUILD_ROAD: {
-        int e = m->edge_lut[a.value[0]][a.value[1]];
-        return (e >= 0) ? 113 + e : -1;
-    }
-    case AT_MOVE_ROBBER: {
-        int x = a.value[0]+3, y = a.value[1]+3, z = a.value[2]+3;
-        if (x < 0 || x >= 7 || y < 0 || y >= 7 || z < 0 || z >= 7) return -1;
-        int ti = m->coord_to_tile[x][y][z];
-        if (ti < 0) return -1;
-        int si = (a.value[3] < 0) ? 4 : a.value[3];
-        return 185 + ti * 5 + si;
-    }
-    case AT_DISCARD_RESOURCE:
-        return (a.value[0] >= 0 && a.value[0] < 5) ? 280 + a.value[0] : -1;
-    case AT_PLAY_YEAR_OF_PLENTY: {
-        int r1 = a.value[0], r2 = a.value[1];
-        if (r1 < 0 || r1 >= 5) return -1;
-        if (r2 < 0) return 285 + 15 + r1;
-        if (r2 >= 5) return -1;
-        return 285 + YOP_LUT[r1][r2];
-    }
-    case AT_PLAY_MONOPOLY:
-        return (a.value[0] >= 0 && a.value[0] < 5) ? 305 + a.value[0] : -1;
-    case AT_MARITIME_TRADE: {
-        int give = a.value[0], get = a.value[4];
-        if (give < 0 || give >= 5 || get < 0 || get >= 5) return -1;
-        int mi = m->mar_lut[give][get];
-        return (mi >= 0) ? 310 + mi : -1;
-    }
-    default: return -1;
-    }
+    return false;
 }
 
-static void encode_action_mask(const NNModel *m, const Action *le, int n_le,
-                               float mask[NN_MASK_DIM]) {
-    memset(mask, 0, sizeof(float) * NN_MASK_DIM);
-    for (int i = 0; i < n_le; i++) {
-        int idx = action_to_idx(m, le[i]);
-        if (idx >= 0 && idx < NN_MASK_DIM) mask[idx] = 1.0f;
-    }
-}
-
-
-/* ── Action Formatting ──────────────────────────────────────────── */
-
-static const char *action_name(int type) {
+static const char *action_name(ActionType type) {
     switch (type) {
     case AT_ROLL: return "ROLL";
     case AT_MOVE_ROBBER: return "ROBBER";
@@ -272,514 +74,311 @@ static const char *action_name(int type) {
     case AT_PLAY_MONOPOLY: return "MONOPOLY";
     case AT_PLAY_ROAD_BUILDING: return "ROAD_BUILDING";
     case AT_MARITIME_TRADE: return "MARITIME";
+    case AT_ACCEPT_TRADE: return "ACCEPT_TRADE";
+    case AT_REJECT_TRADE: return "REJECT_TRADE";
+    case AT_CANCEL_TRADE: return "CANCEL_TRADE";
+    case AT_CONFIRM_TRADE: return "CONFIRM_TRADE";
     case AT_END_TURN: return "END_TURN";
     default: return "UNKNOWN";
     }
 }
 
-static void format_action(char *buf, size_t sz, Action a) {
-    switch (a.type) {
-    case AT_BUILD_SETTLEMENT:
-    case AT_BUILD_CITY:
-        snprintf(buf, sz, "%s(node=%d)", action_name(a.type), a.value[0]);
-        break;
-    case AT_BUILD_ROAD:
-        snprintf(buf, sz, "ROAD(%d-%d)", a.value[0], a.value[1]);
-        break;
-    case AT_MOVE_ROBBER:
-        if (a.value[3] >= 0)
-            snprintf(buf, sz, "ROBBER((%d,%d,%d),steal_P%d)",
-                     a.value[0], a.value[1], a.value[2], a.value[3]);
-        else
-            snprintf(buf, sz, "ROBBER((%d,%d,%d),no_steal)",
-                     a.value[0], a.value[1], a.value[2]);
-        break;
-    case AT_MARITIME_TRADE: {
-        const char *give = (a.value[0] >= 0 && a.value[0] < 5) ? RES_NAMES[a.value[0]] : "?";
-        const char *get  = (a.value[4] >= 0 && a.value[4] < 5) ? RES_NAMES[a.value[4]] : "?";
-        snprintf(buf, sz, "MARITIME(%s->%s)", give, get);
-        break;
-    }
-    case AT_DISCARD_RESOURCE:
-        snprintf(buf, sz, "DISCARD(%s)",
-                 (a.value[0] >= 0 && a.value[0] < 5) ? RES_NAMES[a.value[0]] : "?");
-        break;
-    default:
-        snprintf(buf, sz, "%s", action_name(a.type));
-        break;
-    }
-}
-
-static bool is_interesting(int type) {
-    return type == AT_BUILD_SETTLEMENT || type == AT_BUILD_CITY ||
-           type == AT_BUILD_ROAD || type == AT_BUY_DEVELOPMENT_CARD ||
-           type == AT_MOVE_ROBBER || type == AT_PLAY_KNIGHT_CARD ||
-           type == AT_MARITIME_TRADE;
-}
-
-
-/* ── Search Heuristics ──────────────────────────────────────────── */
-
-static float action_bonus(Action a) {
-    switch (a.type) {
-    case AT_BUILD_CITY:            return 1.0f;
-    case AT_BUILD_SETTLEMENT:      return 0.4f;
-    case AT_BUILD_ROAD:            return 0.05f;
-    case AT_BUY_DEVELOPMENT_CARD:  return 0.1f;
-    default: return 0.0f;
-    }
-}
-
-static int fix_robber_steal(int chosen, const Action *le, int n_le) {
-    Action act = le[chosen];
-    if (act.type != AT_MOVE_ROBBER || act.value[3] >= 0)
-        return chosen;
+static int fix_robber_steal(int chosen, const Action *actions, int n_actions) {
+    Action act = actions[chosen];
+    if (act.type != AT_MOVE_ROBBER || act.value[3] >= 0) return chosen;
     int tx = act.value[0], ty = act.value[1], tz = act.value[2];
-    for (int i = 0; i < n_le; i++) {
-        if (le[i].type == AT_MOVE_ROBBER && le[i].value[3] >= 0 &&
-            le[i].value[0] == tx && le[i].value[1] == ty && le[i].value[2] == tz)
+    for (int i = 0; i < n_actions; i++) {
+        if (actions[i].type == AT_MOVE_ROBBER && actions[i].value[3] >= 0 &&
+            actions[i].value[0] == tx && actions[i].value[1] == ty && actions[i].value[2] == tz) {
             return i;
+        }
     }
-    for (int i = 0; i < n_le; i++) {
-        if (le[i].type == AT_MOVE_ROBBER && le[i].value[3] >= 0)
-            return i;
+    for (int i = 0; i < n_actions; i++) {
+        if (actions[i].type == AT_MOVE_ROBBER && actions[i].value[3] >= 0) return i;
     }
     return chosen;
 }
 
-
-/* ── Search ─────────────────────────────────────────────────────── */
-
-static void policy_step(const NNModel *m, Game *gc,
-                        float nf_buf[NN_NODES][NN_NODE_FEAT],
-                        float ef_buf[NN_MAX_EDGES][NN_EDGE_FEAT],
-                        float ff_buf[NN_FLAT_DIM],
-                        float mk_buf[NN_MASK_DIM]) {
-    Action acts[MAX_ACTIONS];
-    int n = generate_playable_actions(&gc->state, acts, MAX_ACTIONS);
-    if (n == 0) return;
-    if (n == 1) { int dn; game_execute(gc, acts[0], acts, &dn); return; }
-
-    encode_state(gc, m, nf_buf, ef_buf, ff_buf);
-    encode_action_mask(m, acts, n, mk_buf);
-    NNOutput out;
-    nn_forward(m, nf_buf, ef_buf, ff_buf, mk_buf, &out);
-
-    int best_i = 0;
-    float best_v = -1e30f;
-    for (int i = 0; i < n; i++) {
-        int idx = action_to_idx(m, acts[i]);
-        float v = (idx >= 0 && idx < AD) ? out.policy[idx] : -1e30f;
-        if (v > best_v) { best_v = v; best_i = i; }
+static int immediate_win_idx(Game *g, const Action *actions, int n_actions) {
+    Color us = state_current_color(&g->state);
+    for (int i = 0; i < n_actions; i++) {
+        Game child;
+        Action tmp[MAX_ACTIONS];
+        int ntmp = 0;
+        game_copy(&child, g);
+        game_execute(&child, actions[i], tmp, &ntmp);
+        if (game_winning_color(&child) == us) return i;
     }
-    int dn;
-    game_execute(gc, acts[best_i], acts, &dn);
+    return -1;
 }
 
-static int abt_search(const NNModel *m, Game *g,
-                      const Action *le, int n_le, int depth, int top_k,
-                      float nf_buf[NN_NODES][NN_NODE_FEAT],
-                      float ef_buf[NN_MAX_EDGES][NN_EDGE_FEAT],
-                      float ff_buf[NN_FLAT_DIM],
-                      float mk_buf[NN_MASK_DIM]) {
-    int seat = g->state.current_player_index;
-    Color seat_color = g->state.colors[seat];
+static int choose_m2_0ply(AgentRuntime *rt, NNModel *model, const StateEncoderC *enc,
+                          Game *g, Action *actions, int n_actions) {
+    int win = immediate_win_idx(g, actions, n_actions);
+    if (win >= 0) return win;
 
-    encode_state(g, m, nf_buf, ef_buf, ff_buf);
-    encode_action_mask(m, le, n_le, mk_buf);
-    NNOutput out;
-    nn_forward(m, nf_buf, ef_buf, ff_buf, mk_buf, &out);
+    encode_state_full(enc, g, rt->nf, rt->ef, rt->ff);
+    memset(rt->mk, 0, sizeof(rt->mk));
 
-    float scores[MAX_ACTIONS];
-    for (int i = 0; i < n_le; i++) {
-        int idx = action_to_idx(m, le[i]);
-        scores[i] = (idx >= 0 && idx < AD) ? out.policy[idx] : -1e30f;
+    int pidx[256];
+    for (int i = 0; i < n_actions && i < 256; i++) {
+        pidx[i] = policy_action_encode(model, &actions[i]);
+        if (pidx[i] >= 0 && pidx[i] < NN_MASK_DIM) rt->mk[pidx[i]] = 1.0f;
     }
 
-    int cands[MAX_ACTIONS];
-    int n_cands = n_le;
-    for (int i = 0; i < n_le; i++) cands[i] = i;
+    NNOutput nn_out;
+    nn_forward(model,
+               (const float (*)[NN_NODE_FEAT])rt->nf,
+               (const float (*)[NN_EDGE_FEAT])rt->ef,
+               rt->ff, rt->mk, &nn_out);
 
-    if (n_le > top_k && depth >= 2) {
-        for (int i = 0; i < top_k; i++) {
-            int best = i;
-            for (int j = i + 1; j < n_le; j++)
-                if (scores[cands[j]] > scores[cands[best]]) best = j;
-            int tmp = cands[i]; cands[i] = cands[best]; cands[best] = tmp;
+    int best = 0;
+    float best_logit = -1e30f;
+    for (int i = 0; i < n_actions && i < 256; i++) {
+        float logit = (pidx[i] >= 0 && pidx[i] < 337) ? nn_out.policy[pidx[i]] : -1e30f;
+        if (logit > best_logit) {
+            best_logit = logit;
+            best = i;
         }
-        n_cands = top_k;
     }
+    return fix_robber_steal(best, actions, n_actions);
+}
+
+static int choose_hs(AgentRuntime *rt, Game *g, Action *actions, int n_actions) {
+    int win = immediate_win_idx(g, actions, n_actions);
+    if (win >= 0) return win;
+
+    int k_root = HS_K[0];
+    if (k_root > n_actions) k_root = n_actions;
+
+    int top[16];
+    int n_top = policy_top_k_ex(NULL, NULL, g, actions, n_actions, k_root, top,
+                                rt->nf, rt->ef, rt->ff, rt->mk, rt->out, 1);
+    if (n_top <= 0) return 0;
 
     int best_pos = 0;
-    float best_val = -1e30f;
-
-    for (int p = 0; p < n_cands; p++) {
-        int ci = cands[p];
-        Game gc;
-        game_copy(&gc, g);
-        Action tmp_acts[MAX_ACTIONS];
-        int tmp_n;
-        game_execute(&gc, le[ci], tmp_acts, &tmp_n);
-
-        for (int ply = 2; ply <= depth; ply++) {
-            if (game_winning_color(&gc) != COLOR_NONE) break;
-            policy_step(m, &gc, nf_buf, ef_buf, ff_buf, mk_buf);
-        }
-
-        float v;
-        Color w = game_winning_color(&gc);
-        if (w != COLOR_NONE)
-            v = (w == seat_color) ? 10.0f : -10.0f;
-        else
-            v = (float)base_value_fn(&gc, seat_color);
-        v += action_bonus(le[ci]);
-
-        if (v > best_val) { best_val = v; best_pos = p; }
-    }
-
-    int chosen = cands[best_pos];
-    return fix_robber_steal(chosen, le, n_le);
+    Color us = state_current_color(&g->state);
+    deep_search_root(rt->leaf_ctx, g, us, top, n_top, &best_pos);
+    if (best_pos < 0 || best_pos >= n_top) best_pos = 0;
+    return fix_robber_steal(top[best_pos], actions, n_actions);
 }
 
-
-/* ── Proper Alpha-Beta search (catanatron semantics) ──────────── */
-
-#include "search.h"
-
-static double base_value_wrapper(Game *g, Color color) {
-    return base_value_fn(g, color);
+static bool needs_model(AgentKind a, AgentKind b, bool h2h) {
+    return a == AGENT_M2_0PLY || (h2h && b == AGENT_M2_0PLY);
 }
 
-static int ab_choose(Game *g, Action *le, int n_le, int depth) {
-    Color bc = g->state.colors[g->state.current_player_index];
-    SearchCtx ctx = {0};
-    Action acts_copy[MAX_ACTIONS];
-    memcpy(acts_copy, le, n_le * sizeof(Action));
-    SearchResult r = alphabeta_search(&ctx, g, acts_copy, n_le,
-                                       depth, -1e30, 1e30, bc,
-                                       base_value_wrapper);
-    for (int i = 0; i < n_le; i++) {
-        if (memcmp(&le[i], &r.action, sizeof(Action)) == 0)
-            return i;
+static int load_model_if_needed(NNModel **model_out, const char *weights_path, bool needed) {
+    *model_out = NULL;
+    if (!needed) return 0;
+    NNModel *model = (NNModel *)calloc(1, sizeof(NNModel));
+    if (!model) {
+        fprintf(stderr, "OOM allocating NNModel\n");
+        return -1;
     }
+    if (nn_load(model, weights_path) != 0) {
+        fprintf(stderr, "Failed to load model weights: %s\n", weights_path);
+        free(model);
+        return -1;
+    }
+    *model_out = model;
     return 0;
 }
 
-static int ab2_choose(Game *g, Action *le, int n_le) {
-    return ab_choose(g, le, n_le, 2);
-}
-
-
-/* ── Super M2: deep recursive search with policy pruning ───────── */
-/*
- * 4p_super_m2 setup:
- *   our_depth = 6
- *   k_schedule = [12, 8, 6, 5, 4, 3]
- *   AB-leaf evaluation
- *   AB2 opponent simulation inside rollouts
- *   Pure C inner loop (no Python in tight loop)
- */
-
-typedef struct {
-    DeepSearchCtx *ctx;
-    StateEncoderC enc;
-    bool initialized;
-    int our_depth;
-    int k_schedule[8];
-    int schedule_len;
-    int opp_ab_depth;
-    double time_budget_sec;
-} SuperM2;
-
-static void super_m2_init(SuperM2 *sm, NNModel *model, Game *g0) {
-    sm->our_depth = 6;
-    int sched[6] = {12, 8, 6, 5, 4, 3};
-    memcpy(sm->k_schedule, sched, sizeof(sched));
-    sm->schedule_len = 6;
-    sm->opp_ab_depth = 2;
-    sm->time_budget_sec = 4.0;
-
-    state_encoder_init(&sm->enc, g0, 4);
-
-    /* Leaf cache: 1<<20 entries = 1M buckets */
-    sm->ctx = deep_search_create_c(20, model, &sm->enc);
-    if (!sm->ctx) {
-        fprintf(stderr, "deep_search_create_c failed\n");
-        exit(1);
-    }
-
-    deep_search_configure(sm->ctx, sm->our_depth,
-                          sm->k_schedule, sm->schedule_len,
-                          sm->opp_ab_depth, sm->time_budget_sec);
-    sm->initialized = true;
-}
-
-static void super_m2_destroy(SuperM2 *sm) {
-    if (sm->ctx) {
-        deep_search_destroy(sm->ctx);
-        sm->ctx = NULL;
-    }
-    sm->initialized = false;
-}
-
-/* Pick a move using deep_search. Returns index into le[0..n_le-1]. */
-static int super_m2_choose(SuperM2 *sm, NNModel *model, Game *g,
-                           Action *le, int n_le,
-                           float nf_buf[NN_NODES][NN_NODE_FEAT],
-                           float ef_buf[NN_MAX_EDGES][NN_EDGE_FEAT],
-                           float ff_buf[NN_FLAT_DIM],
-                           float mk_buf[NN_MASK_DIM]) {
-    if (n_le <= 1) return 0;
-
-    int seat = g->state.current_player_index;
-    Color seat_color = g->state.colors[seat];
-
-    /* Terminal-winning move shortcut */
-    for (int i = 0; i < n_le; i++) {
-        Game test;
-        game_copy(&test, g);
-        Action tmp[MAX_ACTIONS];
-        int tn;
-        game_execute(&test, le[i], tmp, &tn);
-        if (game_winning_color(&test) == seat_color) {
-            return i;
+static void init_runtime(AgentRuntime *rt, AgentKind kind) {
+    memset(rt, 0, sizeof(*rt));
+    rt->kind = kind;
+    if (kind == AGENT_HS) {
+        rt->leaf_ctx = deep_search_create_c(HS_CACHE_BITS, NULL, NULL);
+        if (!rt->leaf_ctx) {
+            fprintf(stderr, "deep_search_create_c failed\n");
+            exit(1);
         }
+        deep_search_configure(rt->leaf_ctx, HS_DEPTH, HS_K, 5,
+                              HS_OPP_AB_DEPTH, 5.0);
+        deep_search_set_algo_policy(rt->leaf_ctx, 1);
     }
-
-    /* Get top-K root candidates via policy */
-    int k_root = sm->k_schedule[0];
-    if (k_root > n_le) k_root = n_le;
-
-    int top_indices[16];
-    /* Use a single 4+MASK_DIM scratch buffer for policy_top_k */
-    static float policy_out_buf[4 + NN_MASK_DIM];
-    int n_top = policy_top_k(&sm->enc, model, g, le, n_le, k_root,
-                              top_indices,
-                              (float *)nf_buf, (float *)ef_buf, ff_buf,
-                              mk_buf, policy_out_buf);
-    if (n_top <= 0) return 0;
-
-    /* Run deep recursive search on those candidates */
-    int best_idx_out = -1;
-    deep_search_root(sm->ctx, g, seat_color,
-                     top_indices, n_top, &best_idx_out);
-
-    int best_pi = (best_idx_out >= 0 && best_idx_out < n_top)
-                  ? best_idx_out : 0;
-    int chosen = top_indices[best_pi];
-    return fix_robber_steal(chosen, le, n_le);
 }
 
+static void destroy_runtime(AgentRuntime *rt) {
+    if (rt->leaf_ctx) deep_search_destroy(rt->leaf_ctx);
+    rt->leaf_ctx = NULL;
+}
 
-/* ── Main ───────────────────────────────────────────────────────── */
+static void default_weights_path(char *out, size_t n, const char *argv0) {
+    char tmp[1024];
+    strncpy(tmp, argv0, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    char *dir = dirname(tmp);
+    snprintf(out, n, "%s/weights/model.bin", dir);
+}
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+        "Usage: %s [--agent h-s|m2_0ply] [--games N] [--seed S]\n"
+        "          [--h2h --opponent h-s|m2_0ply] [--weights PATH] [--verbose]\n\n"
+        "Agents:\n"
+        "  m2_0ply       M2 neural policy argmax, no search\n"
+        "  H-S           strongest validated no-ML heuristic search setup\n",
+        argv0);
+}
 
 int main(int argc, char **argv) {
+    AgentKind agent = AGENT_HS;
+    AgentKind opponent = AGENT_M2_0PLY;
     uint64_t seed_base = 42;
-    int num_games = 1;
-    int search_depth = 30;
-    int top_k = 5;
+    int games = 1;
+    bool h2h = false;
     bool verbose = false;
-    int mode = 0;  /* 0=selfplay, 1=2v2, 2=1v3, 3=ab2-only */
-    int ab_depth = 2;
-    bool use_super_m2 = false;
+    char weights_path[1024];
+    default_weights_path(weights_path, sizeof(weights_path), argv[0]);
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
-            seed_base = (uint64_t)atoll(argv[++i]);
-        else if (strcmp(argv[i], "--games") == 0 && i+1 < argc)
-            num_games = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--depth") == 0 && i+1 < argc)
-            search_depth = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--top-k") == 0 && i+1 < argc)
-            top_k = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--verbose") == 0)
+        if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) {
+            if (!parse_agent(argv[++i], &agent)) {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--opponent") == 0 && i + 1 < argc) {
+            if (!parse_agent(argv[++i], &opponent)) {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--games") == 0 && i + 1 < argc) {
+            games = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed_base = (uint64_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) {
+            snprintf(weights_path, sizeof(weights_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--h2h") == 0) {
+            h2h = true;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
-        else if (strcmp(argv[i], "--vs-ab2") == 0)
-            mode = 1;
-        else if (strcmp(argv[i], "--1v3") == 0)
-            mode = 2;
-        else if (strcmp(argv[i], "--ab2-only") == 0)
-            mode = 3;
-        else if (strcmp(argv[i], "--ab-depth") == 0 && i+1 < argc)
-            ab_depth = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--super-m2") == 0)
-            use_super_m2 = true;
-        else if (argv[i][0] != '-')
-            seed_base = (uint64_t)atoll(argv[i]);
-    }
-
-    /* Resolve weights path relative to executable */
-    char exe_dir[1024];
-    strncpy(exe_dir, argv[0], sizeof(exe_dir) - 1);
-    char *dir = dirname(exe_dir);
-    char weights_path[1024];
-    snprintf(weights_path, sizeof(weights_path), "%s/weights/model.bin", dir);
-
-    NNModel *model = (NNModel *)calloc(1, sizeof(NNModel));
-    if (!model) { fprintf(stderr, "OOM\n"); return 1; }
-    if (nn_load(model, weights_path) != 0) {
-        snprintf(weights_path, sizeof(weights_path), "weights/model.bin");
-        if (nn_load(model, weights_path) != 0) {
-            fprintf(stderr, "Failed to load weights/model.bin\n");
-            free(model); return 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            usage(argv[0]);
+            return 2;
         }
     }
 
-    float (*nf)[NN_NODE_FEAT] = calloc(NN_NODES, sizeof(*nf));
-    float (*ef)[NN_EDGE_FEAT] = calloc(NN_MAX_EDGES, sizeof(*ef));
-    float *ff = calloc(NN_FLAT_DIM, sizeof(float));
-    float *mk = calloc(NN_MASK_DIM, sizeof(float));
-    Action *actions = calloc(MAX_ACTIONS, sizeof(Action));
+    if (games < 1) games = 1;
 
-    CatanMap map;
-    RngState map_rng;
-    Color colors[4] = {0, 1, 2, 3};
-    int nn_wins = 0, ab_wins = 0;
-    int wins[4] = {0};
+    NNModel *model = NULL;
+    if (load_model_if_needed(&model, weights_path, needs_model(agent, opponent, h2h)) != 0) {
+        return 1;
+    }
+
+    printf("catan_player: agent=%s", agent_name(agent));
+    if (h2h) printf(" opponent=%s", agent_name(opponent));
+    printf(" games=%d seed=%llu\n", games, (unsigned long long)seed_base);
+
+    int seat_wins[4] = {0};
+    int team_wins = 0, opp_wins = 0;
     int total_turns = 0;
-
-    /* SuperM2 setup (lazy-initialized after first game's map is built) */
-    SuperM2 sm = {0};
-
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    for (int gi = 0; gi < num_games; gi++) {
-        uint64_t seed = seed_base + gi;
+    for (int gi = 0; gi < games; gi++) {
+        uint64_t seed = seed_base + (uint64_t)gi;
+        RngState map_rng;
+        CatanMap map;
         rng_init(&map_rng, seed);
         build_map(&map, MAP_BASE, 0, &map_rng);
 
-        /* Determine NN seats with rotation across games */
-        bool nn_seat[4] = {true, true, true, true};
-        if (mode == 1) {
-            int offset = gi % 4;
-            for (int s = 0; s < 4; s++)
-                nn_seat[s] = (s == offset % 4 || s == (offset + 2) % 4);
-        } else if (mode == 2) {
-            int nn_idx = gi % 4;
-            for (int s = 0; s < 4; s++)
-                nn_seat[s] = (s == nn_idx);
-        } else if (mode == 3) {
-            for (int s = 0; s < 4; s++) nn_seat[s] = false;
-        }
-
+        Color colors[4] = {COLOR_RED, COLOR_BLUE, COLOR_WHITE, COLOR_ORANGE};
         Game g;
         game_init_with_map(&g, &map, 4, colors, seed, 7, false, 10);
-        int decisions = 0;
 
-        /* Initialize SuperM2 once (uses the game's map for STATIC_ADJ + encoder tables) */
-        if (use_super_m2 && !sm.initialized) {
-            super_m2_init(&sm, model, &g);
+        StateEncoderC enc;
+        state_encoder_init(&enc, &g, 4);
+
+        AgentRuntime rt[4];
+        int team_parity = gi & 1;
+        for (int s = 0; s < 4; s++) {
+            AgentKind k = agent;
+            if (h2h) {
+                bool team_seat = (s == team_parity || s == team_parity + 2);
+                k = team_seat ? agent : opponent;
+            }
+            init_runtime(&rt[s], k);
         }
 
-        while (game_winning_color(&g) == COLOR_NONE && g.state.num_turns < 1000) {
-            int n_act = generate_playable_actions(&g.state, actions, MAX_ACTIONS);
-            if (n_act == 0) break;
+        Action actions[MAX_ACTIONS];
+        int decisions = 0;
+        while (game_winning_color(&g) == COLOR_NONE && g.state.num_turns < 500) {
+            int n_actions = generate_playable_actions(&g.state, actions, MAX_ACTIONS);
+            if (n_actions <= 0) break;
 
             int cp = g.state.current_player_index;
-            int chosen;
-            if (n_act == 1) {
-                chosen = 0;
-                if (verbose) {
-                    char buf[128];
-                    format_action(buf, sizeof(buf), actions[0]);
-                    printf("  T%3d P%d %s (forced)\n", g.state.num_turns, cp, buf);
+            int chosen = 0;
+            if (n_actions > 1) {
+                if (rt[cp].kind == AGENT_M2_0PLY) {
+                    chosen = choose_m2_0ply(&rt[cp], model, &enc, &g, actions, n_actions);
+                } else {
+                    chosen = choose_hs(&rt[cp], &g, actions, n_actions);
                 }
-            } else if (mode > 0 && !nn_seat[cp]) {
-                chosen = ab_choose(&g, actions, n_act, ab_depth);
                 decisions++;
-            } else if (use_super_m2) {
-                chosen = super_m2_choose(&sm, model, &g, actions, n_act,
-                                          nf, ef, ff, mk);
-                decisions++;
-                if (verbose || is_interesting(actions[chosen].type)) {
-                    char buf[128];
-                    format_action(buf, sizeof(buf), actions[chosen]);
-                    printf("  T%3d P%d %s [super-m2]\n",
-                           g.state.num_turns, cp, buf);
-                }
-            } else if (search_depth == 0) {
-                /* Pure policy argmax — no search */
-                encode_state(&g, model, nf, ef, ff);
-                encode_action_mask(model, actions, n_act, mk);
-                NNOutput out;
-                nn_forward(model, nf, ef, ff, mk, &out);
-                int best_i = 0;
-                float best_v = -1e30f;
-                for (int ai = 0; ai < n_act; ai++) {
-                    int idx = action_to_idx(model, actions[ai]);
-                    float v = (idx >= 0 && idx < AD) ? out.policy[idx] : -1e30f;
-                    if (v > best_v) { best_v = v; best_i = ai; }
-                }
-                chosen = best_i;
-                decisions++;
-            } else {
-                chosen = abt_search(model, &g, actions, n_act,
-                                    search_depth, top_k, nf, ef, ff, mk);
-                decisions++;
-                if (verbose || is_interesting(actions[chosen].type)) {
-                    char buf[128];
-                    format_action(buf, sizeof(buf), actions[chosen]);
-                    printf("  T%3d P%d %s\n", g.state.num_turns, cp, buf);
-                }
             }
 
-            int next_n;
+            if (verbose) {
+                printf("  T%3d P%d %-12s %s\n",
+                       g.state.num_turns, cp, agent_name(rt[cp].kind),
+                       action_name(actions[chosen].type));
+            }
+
+            int next_n = 0;
             game_execute(&g, actions[chosen], actions, &next_n);
         }
 
         Color winner = game_winning_color(&g);
-        if (winner != COLOR_NONE) {
-            int wi = g.state.color_to_index[winner];
-            wins[wi]++;
-            if (mode > 0) {
-                if (nn_seat[wi]) nn_wins++;
-                else ab_wins++;
-            }
-        }
+        int wi = winner == COLOR_NONE ? -1 : g.state.color_to_index[(int)winner];
+        if (wi >= 0) seat_wins[wi]++;
         total_turns += g.state.num_turns;
 
-        if (num_games == 1) {
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-            printf("\n=============================================\n");
-            if (use_super_m2)
-                printf("  Search: 4p_super_m2 (depth=6, k=12,8,6,5,4,3)\n");
-            else
-                printf("  Search: ABt%d (top-%d)\n", search_depth, top_k);
-            printf("  Seed:   %llu\n", (unsigned long long)seed);
-            printf("  Winner: Player %d\n",
-                   winner != COLOR_NONE ? g.state.color_to_index[winner] : -1);
-            printf("  Turns:  %d\n", g.state.num_turns);
-            printf("  Time:   %.1fs (%d decisions)\n", elapsed, decisions);
-            printf("=============================================\n");
+        int vp[4] = {
+            g.state.player_state[0][PS_ACTUAL_VICTORY_POINTS],
+            g.state.player_state[1][PS_ACTUAL_VICTORY_POINTS],
+            g.state.player_state[2][PS_ACTUAL_VICTORY_POINTS],
+            g.state.player_state[3][PS_ACTUAL_VICTORY_POINTS],
+        };
+
+        if (h2h && wi >= 0) {
+            bool team_win = (wi == team_parity || wi == team_parity + 2);
+            if (team_win) team_wins++;
+            else opp_wins++;
         }
+
+        if (games == 1 || h2h) {
+            printf("[%d/%d] seed=%llu winner=P%d actualVP=[%d %d %d %d] turns=%d decisions=%d",
+                   gi + 1, games, (unsigned long long)seed, wi,
+                   vp[0], vp[1], vp[2], vp[3], g.state.num_turns, decisions);
+            if (h2h) {
+                printf(" team=%s seats=[%d,%d] opp=%s",
+                       agent_name(agent), team_parity, team_parity + 2,
+                       agent_name(opponent));
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+
+        for (int s = 0; s < 4; s++) destroy_runtime(&rt[s]);
     }
 
-    if (num_games > 1) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-        printf("%d games in %.1fs (%.1f games/sec)\n",
-               num_games, elapsed, num_games / elapsed);
-        printf("Avg turns: %.0f\n", (double)total_turns / num_games);
-        if (mode == 1) {
-            printf("2v2: NN=%d  AB2=%d  WR=%.1f%%  (ab_depth=%d)\n",
-                   nn_wins, ab_wins,
-                   100.0 * nn_wins / (nn_wins + ab_wins + 1e-8), ab_depth);
-        } else if (mode == 2) {
-            printf("1v3: NN=%d  AB2=%d  WR=%.1f%%  (ab_depth=%d)\n",
-                   nn_wins, ab_wins,
-                   100.0 * nn_wins / (nn_wins + ab_wins + 1e-8), ab_depth);
-        } else if (mode == 3) {
-            printf("4xAB%d: P0=%d P1=%d P2=%d P3=%d\n",
-                   ab_depth, wins[0], wins[1], wins[2], wins[3]);
-        } else {
-            printf("Wins: P0=%d P1=%d P2=%d P3=%d\n",
-                   wins[0], wins[1], wins[2], wins[3]);
-        }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    printf("\n%d games in %.2fs (%.2f games/s), avg turns %.1f\n",
+           games, elapsed, games / elapsed, (double)total_turns / games);
+    if (h2h) {
+        int decided = team_wins + opp_wins;
+        printf("H2H: %s=%d %s=%d WR=%.1f%%\n",
+               agent_name(agent), team_wins, agent_name(opponent), opp_wins,
+               decided ? 100.0 * team_wins / decided : 0.0);
+    } else {
+        printf("Seat wins: P0=%d P1=%d P2=%d P3=%d\n",
+               seat_wins[0], seat_wins[1], seat_wins[2], seat_wins[3]);
     }
 
-    super_m2_destroy(&sm);
-    free(nf); free(ef); free(ff); free(mk); free(actions); free(model);
+    free(model);
     return 0;
 }

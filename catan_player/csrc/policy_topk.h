@@ -30,4 +30,13 @@ int policy_top_k(const StateEncoderC *enc, const NNModel *m,
                  int k, int *out_indices,
                  float *nf, float *ef, float *ff, float *mk, float *out);
 
+/* Same API, with an optional no-ML algorithmic scorer. When
+ * use_algo_policy != 0, enc/model/buffers are ignored and legal actions are
+ * ranked by the hand-coded policy in policy_topk.c. */
+int policy_top_k_ex(const StateEncoderC *enc, const NNModel *m,
+                    const Game *g, const Action *actions, int n_actions,
+                    int k, int *out_indices,
+                    float *nf, float *ef, float *ff, float *mk, float *out,
+                    int use_algo_policy);
+
 #endif

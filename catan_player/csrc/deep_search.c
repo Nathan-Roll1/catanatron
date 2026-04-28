@@ -51,6 +51,7 @@ struct DeepSearchCtx {
     int opp_ab_depth;
     double time_budget_sec;
     double deadline_clock;
+    int algo_policy;
 
     /* Recursive game/action stack to avoid malloc per-node. */
     Game game_pool[DS_MAX_DEPTH];
@@ -278,10 +279,11 @@ static double deep_search_recurse(DeepSearchCtx *ctx, Game *g,
     if (k > DS_MAX_K) k = DS_MAX_K;
     int *top = ctx->top_pool[depth_idx];
     int n_top;
-    if (ctx->c_nn_model != NULL && ctx->c_enc != NULL) {
-        n_top = policy_top_k(ctx->c_enc, ctx->c_nn_model, g, scratch, n, k,
-                              top, ctx->c_nf_buf, ctx->c_ef_buf, ctx->c_ff_buf,
-                              ctx->c_mk_buf, ctx->c_out_buf);
+    if (ctx->algo_policy || (ctx->c_nn_model != NULL && ctx->c_enc != NULL)) {
+        n_top = policy_top_k_ex(ctx->c_enc, ctx->c_nn_model, g, scratch, n, k,
+                                top, ctx->c_nf_buf, ctx->c_ef_buf, ctx->c_ff_buf,
+                                ctx->c_mk_buf, ctx->c_out_buf,
+                                ctx->algo_policy);
     } else {
         n_top = ctx->policy_fn(ctx->userdata, g, scratch, n, k, top);
     }
@@ -389,6 +391,11 @@ void deep_search_configure(DeepSearchCtx *ctx,
     ctx->schedule_len = schedule_len;
     ctx->opp_ab_depth = opponent_ab_depth;
     ctx->time_budget_sec = time_budget_sec;
+}
+
+void deep_search_set_algo_policy(DeepSearchCtx *ctx, int enabled) {
+    if (!ctx) return;
+    ctx->algo_policy = enabled ? 1 : 0;
 }
 
 double deep_search_root(DeepSearchCtx *ctx, Game *game, Color our_color,
