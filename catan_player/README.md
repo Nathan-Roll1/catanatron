@@ -3,9 +3,10 @@
 Hyper-lightweight, self-contained Catan agents in raw C. No Python runtime,
 no training code, no evaluation harnesses outside this folder.
 
-This repo exposes exactly two agents:
+This repo exposes exactly three agents:
 
 - `H-S`: the strongest validated no-ML heuristic search bot.
+- `AB2`: the full strong alpha-beta baseline used inside H-S rollouts.
 - `m2_0ply`: M2 neural policy argmax, no search.
 
 ## Build
@@ -14,7 +15,7 @@ This repo exposes exactly two agents:
 ./build.sh
 ```
 
-The build produces `./catan_player`. `H-S` does not use neural network
+The build produces `./catan_player`. `H-S` and `AB2` do not use neural network
 inference. The only runtime data file is `weights/model.bin`, needed by
 `m2_0ply`.
 
@@ -27,14 +28,20 @@ inference. The only runtime data file is `weights/model.bin`, needed by
 # M2 0-ply neural policy self-play
 ./catan_player --agent m2_0ply --games 10 --seed 810000
 
+# Full strong AB2 self-play
+./catan_player --agent ab2 --games 10 --seed 810000
+
 # 2v2 head-to-head, alternating seats each game
+./catan_player --h2h --agent h-s --opponent ab2 --games 20 --seed 810000
+
+# Compare any two supported agents
 ./catan_player --h2h --agent h-s --opponent m2_0ply --games 20 --seed 810000
 ```
 
 Useful flags:
 
-- `--agent h-s|m2_0ply`
-- `--opponent h-s|m2_0ply` with `--h2h`
+- `--agent h-s|ab2|m2_0ply`
+- `--opponent h-s|ab2|m2_0ply` with `--h2h`
 - `--games N`
 - `--seed S`
 - `--weights PATH` for alternate M2 weights
@@ -66,13 +73,37 @@ The old internal name for this setup was `leaf0_search`; `h-s`, `hs`,
 `heuristic`, and `leaf0_search` are accepted as aliases, but the bot is called
 `H-S` in output and docs.
 
+## AB2
+
+`AB2` is the full strong alpha-beta baseline, not a random or greedy player.
+It is also the opponent model used inside `H-S` search.
+
+- search depth: `2`
+- search type: alpha-beta minimax
+- chance handling: expectimax expansion for dice rolls, development-card
+  draws, and robber steal outcomes
+- evaluator: original `base_value_fn`
+- aliases: `ab2`, `AB2`, `strong_ab2`, `full_ab2`
+
+Run it directly:
+
+```bash
+./catan_player --agent ab2 --games 10 --seed 810000
+```
+
+Run H-S against AB2 in 2v2:
+
+```bash
+./catan_player --h2h --agent h-s --opponent ab2 --games 100 --seed 810000
+```
+
 ## Layout
 
 ```text
 .
 ├── build.sh
 ├── csrc/
-│   ├── fast_player.c      CLI and two-agent dispatch
+│   ├── fast_player.c      CLI and agent dispatch
 │   ├── policy_topk.c      M2 action encoding and no-ML policy ordering
 │   ├── deep_search.c      H-S recursive search
 │   ├── search.c           AB2 expectimax/alpha-beta

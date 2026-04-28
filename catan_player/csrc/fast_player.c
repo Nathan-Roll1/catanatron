@@ -1,7 +1,8 @@
 /*
- * fast_player.c -- minimal standalone C runner for two agents:
+ * fast_player.c -- minimal standalone C runner for three agents:
  *   - m2_0ply: M2 neural policy argmax, no search
  *   - H-S: strongest validated no-ML heuristic search bot
+ *   - AB2: strong depth-2 alpha-beta/expectimax baseline
  */
 
 #include <libgen.h>
@@ -19,16 +20,20 @@
 #include "map.h"
 #include "nn.h"
 #include "policy_topk.h"
+#include "search.h"
 #include "state_encode.h"
+#include "value.h"
 
 typedef enum {
     AGENT_M2_0PLY = 0,
     AGENT_HS = 1,
+    AGENT_AB2 = 2,
 } AgentKind;
 
 typedef struct {
     AgentKind kind;
     DeepSearchCtx *leaf_ctx;
+    SearchCtx *ab_ctx;
     float nf[ENC_NUM_NODES * ENC_NODE_FEAT_DIM];
     float ef[ENC_NUM_EDGES * ENC_EDGE_FEAT_DIM];
     float ff[ENC_FLAT_FEAT_DIM];
@@ -40,9 +45,15 @@ static const int HS_DEPTH = 5;
 static const int HS_K[5] = {6, 4, 2, 2, 2};
 static const int HS_OPP_AB_DEPTH = 2;
 static const int HS_CACHE_BITS = 20;
+static const int AB2_DEPTH = 2;
 
 static const char *agent_name(AgentKind k) {
-    return k == AGENT_M2_0PLY ? "m2_0ply" : "H-S";
+    switch (k) {
+    case AGENT_M2_0PLY: return "m2_0ply";
+    case AGENT_HS: return "H-S";
+    case AGENT_AB2: return "AB2";
+    }
+    return "unknown";
 }
 
 static bool parse_agent(const char *s, AgentKind *out) {
@@ -55,6 +66,11 @@ static bool parse_agent(const char *s, AgentKind *out) {
         strcmp(s, "leaf0_search") == 0 || strcmp(s, "leaf0") == 0 ||
         strcmp(s, "search") == 0) {
         *out = AGENT_HS;
+        return true;
+    }
+    if (strcmp(s, "AB2") == 0 || strcmp(s, "ab2") == 0 ||
+        strcmp(s, "strong_ab2") == 0 || strcmp(s, "full_ab2") == 0) {
+        *out = AGENT_AB2;
         return true;
     }
     return false;
@@ -163,6 +179,25 @@ static int choose_hs(AgentRuntime *rt, Game *g, Action *actions, int n_actions) 
     return fix_robber_steal(top[best_pos], actions, n_actions);
 }
 
+static int choose_ab2(AgentRuntime *rt, Game *g, Action *actions, int n_actions) {
+    int win = immediate_win_idx(g, actions, n_actions);
+    if (win >= 0) return win;
+
+    Action acts_copy[MAX_ACTIONS];
+    memcpy(acts_copy, actions, (size_t)n_actions * sizeof(Action));
+    memset(rt->ab_ctx, 0, sizeof(*rt->ab_ctx));
+    Color us = state_current_color(&g->state);
+    SearchResult r = alphabeta_search(rt->ab_ctx, g, acts_copy, n_actions,
+                                      AB2_DEPTH, -1e30, 1e30,
+                                      us, base_value_fn);
+    for (int i = 0; i < n_actions; i++) {
+        if (memcmp(&actions[i], &r.action, sizeof(Action)) == 0) {
+            return fix_robber_steal(i, actions, n_actions);
+        }
+    }
+    return 0;
+}
+
 static bool needs_model(AgentKind a, AgentKind b, bool h2h) {
     return a == AGENT_M2_0PLY || (h2h && b == AGENT_M2_0PLY);
 }
@@ -196,12 +231,20 @@ static void init_runtime(AgentRuntime *rt, AgentKind kind) {
         deep_search_configure(rt->leaf_ctx, HS_DEPTH, HS_K, 5,
                               HS_OPP_AB_DEPTH, 5.0);
         deep_search_set_algo_policy(rt->leaf_ctx, 1);
+    } else if (kind == AGENT_AB2) {
+        rt->ab_ctx = (SearchCtx *)calloc(1, sizeof(SearchCtx));
+        if (!rt->ab_ctx) {
+            fprintf(stderr, "AB2 SearchCtx allocation failed\n");
+            exit(1);
+        }
     }
 }
 
 static void destroy_runtime(AgentRuntime *rt) {
     if (rt->leaf_ctx) deep_search_destroy(rt->leaf_ctx);
     rt->leaf_ctx = NULL;
+    free(rt->ab_ctx);
+    rt->ab_ctx = NULL;
 }
 
 static void default_weights_path(char *out, size_t n, const char *argv0) {
@@ -214,11 +257,12 @@ static void default_weights_path(char *out, size_t n, const char *argv0) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s [--agent h-s|m2_0ply] [--games N] [--seed S]\n"
-        "          [--h2h --opponent h-s|m2_0ply] [--weights PATH] [--verbose]\n\n"
+        "Usage: %s [--agent h-s|ab2|m2_0ply] [--games N] [--seed S]\n"
+        "          [--h2h --opponent h-s|ab2|m2_0ply] [--weights PATH] [--verbose]\n\n"
         "Agents:\n"
         "  m2_0ply       M2 neural policy argmax, no search\n"
-        "  H-S           strongest validated no-ML heuristic search setup\n",
+        "  H-S           strongest validated no-ML heuristic search setup\n"
+        "  AB2           depth-2 alpha-beta with expectimax over chance nodes\n",
         argv0);
 }
 
@@ -315,8 +359,10 @@ int main(int argc, char **argv) {
             if (n_actions > 1) {
                 if (rt[cp].kind == AGENT_M2_0PLY) {
                     chosen = choose_m2_0ply(&rt[cp], model, &enc, &g, actions, n_actions);
-                } else {
+                } else if (rt[cp].kind == AGENT_HS) {
                     chosen = choose_hs(&rt[cp], &g, actions, n_actions);
+                } else {
+                    chosen = choose_ab2(&rt[cp], &g, actions, n_actions);
                 }
                 decisions++;
             }
