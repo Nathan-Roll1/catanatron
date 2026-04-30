@@ -25,6 +25,18 @@ SearchResult alphabeta_search(SearchCtx *ctx, Game *g, Action *actions, int num_
                                int depth, double alpha, double beta,
                                Color bot_color, ValueFn eval_fn);
 
+/* Known-future alpha-beta: applies every action through game_execute. */
+SearchResult alphabeta_search_deterministic(SearchCtx *ctx, Game *g,
+                               Action *actions, int num_actions,
+                               int depth, double alpha, double beta,
+                               Color bot_color, ValueFn eval_fn);
+
+/* Known-future MaxN-style search: each turn owner maximizes their own
+ * evaluator component, matching selfish FFA play better than paranoid AB. */
+SearchResult maxn_search_deterministic(SearchCtx *ctx, Game *g,
+                               Action *actions, int num_actions,
+                               int depth, ValueFn eval_fn);
+
 Action random_player_decide(State *s, Action *actions, int n, RngState *rng);
 
 #endif

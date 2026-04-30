@@ -13,6 +13,7 @@
 #include "policy_topk.h"
 #include "actions.h"
 #include "board.h"
+#include "rng.h"
 #include "state_encode.h"
 #include "value.h"
 #include <stdint.h>
@@ -192,6 +193,109 @@ static double node_prod_score(const Game *g, int node, Color color) {
     return prod * 100.0 + variety * 100.0 + port_bonus * 100.0;
 }
 
+static double opening_node_bonus(const Game *g, int node) {
+    const State *s = &g->state;
+    const CatanMap *map = s->board.map;
+    double res_prod[5] = {0.0};
+    int seen[5] = {0};
+    int variety = 0;
+    for (int i = 0; i < map->adjacent_tiles_count[node]; i++) {
+        int ti = map->adjacent_tiles[node][i];
+        const LandTile *t = &map->land_tiles[ti];
+        if (t->resource == RES_NONE || t->number == 0) continue;
+        double p = dice_p(map, t->number);
+        int r = (int)t->resource;
+        res_prod[r] += p;
+        if (!seen[r]) {
+            seen[r] = 1;
+            variety++;
+        }
+    }
+
+    double weighted = 0.0;
+    weighted += res_prod[RES_WOOD]  * 1.04;
+    weighted += res_prod[RES_BRICK] * 1.10;
+    weighted += res_prod[RES_SHEEP] * 0.86;
+    weighted += res_prod[RES_WHEAT] * 1.26;
+    weighted += res_prod[RES_ORE]   * 1.20;
+
+    double bonus = weighted * 220.0 + variety * 7.0;
+    if (seen[RES_WHEAT] && seen[RES_ORE]) bonus += 13.0;
+    if (seen[RES_WOOD] && seen[RES_BRICK]) bonus += 9.0;
+    if (seen[RES_WHEAT] && (seen[RES_WOOD] || seen[RES_BRICK])) bonus += 5.0;
+    if (!seen[RES_WHEAT]) bonus -= 8.0;
+    if (!seen[RES_ORE]) bonus -= 5.0;
+    if (!seen[RES_WOOD] && !seen[RES_BRICK]) bonus -= 7.0;
+    return bonus;
+}
+
+static double opening_profile_scale(const State *s, int profile) {
+    if (profile == 2) return 1.0;
+    if (profile == 3) return 0.55;
+    if (profile == 4) return 0.25;
+    if (profile == 5) return 0.55;
+    if (profile == 7 || profile == 8) {
+        int pi = s->current_player_index;
+        int count = (pi >= 0 && pi < s->num_players) ? s->settlement_count[pi] : 0;
+        bool second_settlement = count >= 1;
+        if (profile == 7) return second_settlement ? 0.25 : 1.0;
+        return second_settlement ? 1.0 : 0.25;
+    }
+    return 0.0;
+}
+
+static double opening_future_scale(int profile) {
+    if (profile == 5) return 1.0;
+    if (profile == 6) return 1.25;
+    return 0.0;
+}
+
+static double opening_future_node_bonus(const Game *g, int node) {
+    const State *s = &g->state;
+    const CatanMap *map = s->board.map;
+    double bonus = 0.0;
+
+    int res_seen[5] = {0};
+    for (int i = 0; i < map->adjacent_tiles_count[node]; i++) {
+        int ti = map->adjacent_tiles[node][i];
+        const LandTile *t = &map->land_tiles[ti];
+        if (t->resource != RES_NONE && t->number != 0)
+            res_seen[(int)t->resource] = 1;
+    }
+
+    double res_w[5] = {1.15, 1.22, 0.82, 1.28, 1.18};
+    RngState rng = g->rng;
+    const int horizon = 18;
+    for (int step = 0; step < horizon; step++) {
+        int sum = rng_randint(&rng, 1, 6) + rng_randint(&rng, 1, 6);
+        if (sum == 7) continue;
+        double decay = (double)(horizon - step) / (double)horizon;
+        for (int i = 0; i < map->adjacent_tiles_count[node]; i++) {
+            int ti = map->adjacent_tiles[node][i];
+            const LandTile *t = &map->land_tiles[ti];
+            if (t->resource == RES_NONE || t->number == 0) continue;
+            if (t->number != sum) continue;
+            if (coord_eq(map->land_tile_coords[ti], s->board.robber_coordinate)) continue;
+            bonus += 18.0 * decay * res_w[(int)t->resource];
+        }
+    }
+
+    int pi = s->current_player_index;
+    if (s->is_initial_build_phase && pi >= 0 && pi < s->num_players &&
+        s->settlement_count[pi] == 1) {
+        for (int i = 0; i < map->adjacent_tiles_count[node]; i++) {
+            int ti = map->adjacent_tiles[node][i];
+            const LandTile *t = &map->land_tiles[ti];
+            if (t->resource == RES_NONE || t->number == 0) continue;
+            bonus += 30.0 * res_w[(int)t->resource];
+        }
+    }
+
+    if (res_seen[RES_WHEAT] && res_seen[RES_ORE]) bonus += 8.0;
+    if (res_seen[RES_WOOD] && res_seen[RES_BRICK]) bonus += 7.0;
+    return bonus;
+}
+
 static int can_afford(const State *s, int pi, const int cost[5]) {
     for (int r = 0; r < NUM_RESOURCES; r++) {
         if (s->player_state[pi][PS_RESOURCE_IN_HAND(r)] < cost[r]) return 0;
@@ -252,7 +356,7 @@ static double road_score(const Game *g, const Action *a, Color color) {
     return score;
 }
 
-static double algo_base_score(const Game *g, const Action *a) {
+static double algo_base_score_profile(const Game *g, const Action *a, int profile) {
     const State *s = &g->state;
     Color color = state_current_color(s);
     int pi = current_idx(s);
@@ -266,6 +370,8 @@ static double algo_base_score(const Game *g, const Action *a) {
     if (a->type == AT_CONFIRM_TRADE) return 5.0;
 
     double score = 0.0;
+    double opening_scale = opening_profile_scale(s, profile);
+    double future_scale = opening_future_scale(profile);
     switch (a->type) {
     case AT_BUILD_CITY:
         score = 900.0 + 6.0 * node_prod_score(g, a->value[0], color);
@@ -273,12 +379,32 @@ static double algo_base_score(const Game *g, const Action *a) {
         break;
     case AT_BUILD_SETTLEMENT:
         score = 820.0 + 5.0 * node_prod_score(g, a->value[0], color);
-        if (s->is_initial_build_phase) score += 220.0;
+        if (s->is_initial_build_phase) {
+            score += 220.0;
+            if (opening_scale > 0.0)
+                score += opening_scale * opening_node_bonus(g, a->value[0]);
+            if (future_scale > 0.0)
+                score += future_scale * opening_future_node_bonus(g, a->value[0]);
+        }
         if (vp >= g->vps_to_win - 1) score += 100000.0;
         break;
     case AT_BUILD_ROAD:
         score = 380.0 + road_score(g, a, color);
-        if (s->is_initial_build_phase) score += 120.0;
+        if (s->is_initial_build_phase) {
+            score += 120.0;
+            if (opening_scale > 0.0) {
+                if (bs_test(s->board.buildable, a->value[0]))
+                    score += opening_scale * 0.35 * opening_node_bonus(g, a->value[0]);
+                if (bs_test(s->board.buildable, a->value[1]))
+                    score += opening_scale * 0.35 * opening_node_bonus(g, a->value[1]);
+            }
+            if (future_scale > 0.0) {
+                if (bs_test(s->board.buildable, a->value[0]))
+                    score += future_scale * 0.25 * opening_future_node_bonus(g, a->value[0]);
+                if (bs_test(s->board.buildable, a->value[1]))
+                    score += future_scale * 0.25 * opening_future_node_bonus(g, a->value[1]);
+            }
+        }
         break;
     case AT_BUY_DEVELOPMENT_CARD:
         score = 520.0 + 12.0 * vp + 4.0 * ps[PS_ORE_IN_HAND] + 3.0 * ps[PS_WHEAT_IN_HAND];
@@ -329,6 +455,10 @@ static double algo_base_score(const Game *g, const Action *a) {
         break;
     }
     return score;
+}
+
+static double algo_base_score(const Game *g, const Action *a) {
+    return algo_base_score_profile(g, a, 1);
 }
 
 /* Sort descending by logit (qsort comparator) */
@@ -414,7 +544,8 @@ int policy_top_k_ex(const StateEncoderC *enc, const NNModel *m,
         ScoredAction scored[256];
         int n_scored = n_actions < 256 ? n_actions : 256;
         for (int i = 0; i < n_scored; i++) {
-            scored[i].logit = (float)algo_base_score(g, &actions[i]);
+            scored[i].logit = (float)algo_base_score_profile(g, &actions[i],
+                                                             use_algo_policy);
             scored[i].idx = i;
         }
         if (k > n_scored) k = n_scored;

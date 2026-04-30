@@ -13,8 +13,8 @@ CSRC="$SCRIPT_DIR/csrc"
 OUT="$SCRIPT_DIR/catan_player"
 
 CC="${CC:-cc}"
-CFLAGS="-O3 -march=native -flto -ffast-math -funroll-loops -I${CSRC}"
-LDFLAGS="-lm"
+CFLAGS="-O3 -march=native -flto -ffast-math -funroll-loops -pthread -I${CSRC}"
+LDFLAGS="-lm -pthread"
 
 case "$(uname -s)" in
     Darwin) CFLAGS="$CFLAGS -framework Accelerate" ;;
@@ -35,7 +35,7 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 SRCS="fast_player.c nn.c rng.c map.c board.c state.c actions.c"
-SRCS="$SRCS apply_action.c game.c value.c search.c"
+SRCS="$SRCS apply_action.c game.c value.c search.c state_hash.c"
 SRCS="$SRCS state_encode.c policy_topk.c deep_search.c"
 
 SRC_PATHS=""

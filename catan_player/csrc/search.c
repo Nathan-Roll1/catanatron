@@ -35,6 +35,11 @@ static double eval_action_expected(SearchCtx *ctx, Game *g, Action a,
                                     int child_depth, double alpha, double beta,
                                     Color bot_color, ValueFn eval_fn,
                                     Game *child, Action *child_actions);
+static double eval_action_deterministic(SearchCtx *ctx, Game *g, Action a,
+                                         int child_depth, double alpha,
+                                         double beta, Color bot_color,
+                                         ValueFn eval_fn, Game *child,
+                                         Action *child_actions);
 
 SearchResult alphabeta_search(SearchCtx *ctx, Game *g, Action *actions, int num_actions,
                                int depth, double alpha, double beta,
@@ -80,6 +85,116 @@ SearchResult alphabeta_search(SearchCtx *ctx, Game *g, Action *actions, int num_
 
     ctx->depth_counter = pool_idx;
     return result;
+}
+
+SearchResult alphabeta_search_deterministic(SearchCtx *ctx, Game *g,
+                               Action *actions, int num_actions,
+                               int depth, double alpha, double beta,
+                               Color bot_color, ValueFn eval_fn) {
+    SearchResult result = {.value = 0, .action = {0}};
+
+    if (depth <= 0 || game_winning_color(g) != COLOR_NONE ||
+        ctx->depth_counter >= MAX_SEARCH_DEPTH) {
+        result.value = eval_fn(g, bot_color);
+        return result;
+    }
+
+    qsort(actions, num_actions, sizeof(Action), action_cmp);
+
+    int pool_idx = ctx->depth_counter++;
+    Game *child = &ctx->pool[pool_idx];
+    Action *child_actions = ctx->actions[pool_idx];
+    bool maximizing = (state_current_color(&g->state) == bot_color);
+
+    if (maximizing) {
+        result.value = -1e30;
+        for (int i = 0; i < num_actions; i++) {
+            int child_depth = (actions[i].type == AT_ROLL) ? depth : depth - 1;
+            double v = eval_action_deterministic(ctx, g, actions[i], child_depth,
+                                                 alpha, beta, bot_color,
+                                                 eval_fn, child, child_actions);
+            if (v > result.value) { result.value = v; result.action = actions[i]; }
+            alpha = fmax(alpha, result.value);
+            if (alpha >= beta) break;
+        }
+    } else {
+        result.value = 1e30;
+        for (int i = 0; i < num_actions; i++) {
+            int child_depth = (actions[i].type == AT_ROLL) ? depth : depth - 1;
+            double v = eval_action_deterministic(ctx, g, actions[i], child_depth,
+                                                 alpha, beta, bot_color,
+                                                 eval_fn, child, child_actions);
+            if (v < result.value) { result.value = v; result.action = actions[i]; }
+            beta = fmin(beta, result.value);
+            if (beta <= alpha) break;
+        }
+    }
+
+    ctx->depth_counter = pool_idx;
+    return result;
+}
+
+typedef struct {
+    Action action;
+    double values[MAX_PLAYERS];
+} MaxNResult;
+
+static MaxNResult maxn_recurse_deterministic(SearchCtx *ctx, Game *g,
+                                             Action *actions, int num_actions,
+                                             int depth, ValueFn eval_fn) {
+    MaxNResult result;
+    memset(&result, 0, sizeof(result));
+
+    Color winner = game_winning_color(g);
+    if (depth <= 0 || winner != COLOR_NONE ||
+        ctx->depth_counter >= MAX_SEARCH_DEPTH || num_actions <= 0) {
+        for (int p = 0; p < g->state.num_players; p++) {
+            result.values[p] = eval_fn(g, g->state.colors[p]);
+        }
+        return result;
+    }
+
+    qsort(actions, num_actions, sizeof(Action), action_cmp);
+
+    int pool_idx = ctx->depth_counter++;
+    Game *child = &ctx->pool[pool_idx];
+    Action *child_actions = ctx->actions[pool_idx];
+    int cp = g->state.current_player_index;
+
+    double best = -1e300;
+    int have_best = 0;
+    for (int i = 0; i < num_actions; i++) {
+        int child_depth = (actions[i].type == AT_ROLL) ? depth : depth - 1;
+        game_copy(child, g);
+        int child_n = 0;
+        game_execute(child, actions[i], child_actions, &child_n);
+
+        MaxNResult child_result = maxn_recurse_deterministic(
+            ctx, child, child_actions, child_n, child_depth, eval_fn);
+        double v = child_result.values[cp];
+        if (!have_best || v > best) {
+            best = v;
+            have_best = 1;
+            result = child_result;
+            result.action = actions[i];
+        }
+    }
+
+    ctx->depth_counter = pool_idx;
+    return result;
+}
+
+SearchResult maxn_search_deterministic(SearchCtx *ctx, Game *g,
+                               Action *actions, int num_actions,
+                               int depth, ValueFn eval_fn) {
+    SearchResult out = {.value = 0, .action = {0}};
+    if (num_actions <= 0) return out;
+    int root_idx = g->state.current_player_index;
+    MaxNResult r = maxn_recurse_deterministic(ctx, g, actions, num_actions,
+                                              depth, eval_fn);
+    out.action = r.action;
+    out.value = r.values[root_idx];
+    return out;
 }
 
 /* Compute expected value of taking `a` from `g`, expanding chance nodes
@@ -191,6 +306,24 @@ static double eval_action_expected(SearchCtx *ctx, Game *g, Action a,
     SearchResult sr = alphabeta_search(ctx, child, child_actions, child_n,
                                         child_depth, alpha, beta,
                                         bot_color, eval_fn);
+    return sr.value;
+}
+
+/* Deterministic known-future transition: every action is applied through
+ * game_execute so the copied Game.rng, dev deck order, and robber steal RNG
+ * define the sole child state. */
+static double eval_action_deterministic(SearchCtx *ctx, Game *g, Action a,
+                                         int child_depth, double alpha,
+                                         double beta, Color bot_color,
+                                         ValueFn eval_fn, Game *child,
+                                         Action *child_actions) {
+    game_copy(child, g);
+    int child_n;
+    game_execute(child, a, child_actions, &child_n);
+    SearchResult sr = alphabeta_search_deterministic(ctx, child, child_actions,
+                                                     child_n, child_depth,
+                                                     alpha, beta,
+                                                     bot_color, eval_fn);
     return sr.value;
 }
 
