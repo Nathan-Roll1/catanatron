@@ -10,6 +10,7 @@ import argparse
 import ctypes
 import multiprocessing as mp
 import os
+import struct
 import sys
 import time
 
@@ -18,8 +19,23 @@ import numpy as np
 CSRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "csrc")
 
 
+def _load_heuristic(path):
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"HPOL":
+            raise ValueError(f"{path} is not an HPOL heuristic file")
+        ver, fd, ad = struct.unpack("<III", f.read(12))
+        if ver != 1 or fd != 115 or ad != 337:
+            raise ValueError(f"bad HPOL header: ver={ver} fd={fd} ad={ad}")
+        bias = np.frombuffer(f.read(ad * 4), dtype="<f4").copy()
+        weight = np.frombuffer(f.read(ad * fd * 4), dtype="<f4").reshape(ad, fd).copy()
+    return bias, weight
+
+
 def play_one(args):
-    seed, nn_seats_list, ab2_seats_list, weights_path, depth, ab_depth, use_ab_value, top_k, flat_k_arg, opp_weights_path, opp_depth = args
+    (seed, nn_seats_list, ab2_seats_list, weights_path, depth, ab_depth,
+     use_ab_value, top_k, flat_k_arg, opp_weights_path, opp_depth,
+     heuristic_path) = args
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_root not in sys.path:
@@ -45,6 +61,10 @@ def play_one(args):
     if not os.path.exists(lib_path):
         lib_path = os.path.join(CSRC, "libnn.dylib")
 
+    h_bias = h_weight = None
+    if heuristic_path:
+        h_bias, h_weight = _load_heuristic(heuristic_path)
+
     nn_lib = ctypes.CDLL(lib_path)
     nn_lib.nn_load.restype = ctypes.c_int
     nn_lib.nn_forward.restype = None
@@ -53,7 +73,8 @@ def play_one(args):
     nn_lib.nn_value_only.argtypes = [ctypes.c_void_p, FP, FP, FP, FP, FP]
     mbuf = (ctypes.c_char * (8 * 1024 * 1024))()
     mptr = ctypes.cast(mbuf, ctypes.c_void_p)
-    assert nn_lib.nn_load(mptr, weights_path.encode()) == 0
+    if not heuristic_path or depth > 0:
+        assert nn_lib.nn_load(mptr, weights_path.encode()) == 0
 
     nf = np.zeros((N, NF), dtype=np.float32)
     ef = np.zeros((E, EF), dtype=np.float32)
@@ -75,6 +96,14 @@ def play_one(args):
         nn_lib.nn_forward(mptr, nfp, efp, ffp, mkp, out.ctypes.data_as(ctypes.c_void_p))
         lo = out[4:4+AD]; lo[mn < 0.5] = -1e9
         ai = int(np.argmax(lo))
+        return next((i for i, a in enumerate(le) if ae.encode(a) == ai), 0)
+
+    def heuristic_argmax(game, le):
+        se.encode_into(game.get_state_view(), nf, ef, ff)
+        mn = ae.get_action_mask(le).numpy()
+        scores = h_bias + h_weight @ ff
+        scores[mn[:AD] < 0.5] = -1e9
+        ai = int(np.argmax(scores))
         return next((i for i, a in enumerate(le) if ae.encode(a) == ai), 0)
 
     def c_topk(game, le, k):
@@ -314,7 +343,9 @@ def play_one(args):
         if len(le) == 1: game.step(0); continue
         cp = game.current_player()
         if cp in nn_seats:
-            if depth == 0:
+            if heuristic_path and depth == 0:
+                game.step(heuristic_argmax(game, le))
+            elif depth == 0:
                 game.step(nn_argmax(game, le))
             else:
                 game.step(nnt_search(game, le, depth))
@@ -327,7 +358,14 @@ def play_one(args):
             game.step(ab2_choose(game, le, ab_depth))
     w = game.winner()
     tag = "NN" if (w is not None and w in nn_seats) else ("AB2" if w is not None else "draw")
-    return (seed, w, tag, game.turn_number)
+    vps = [int(game._game.state.player_state[s][0]) for s in range(4)]
+    nn_rank_sum = 0
+    for s in nn_seats:
+        nn_rank_sum += sorted(range(4), key=lambda p: (-vps[p], p)).index(s) + 1
+    nn_avg_vp = sum(vps[s] for s in nn_seats) / max(len(nn_seats), 1)
+    ab2_avg_vp = sum(vps[s] for s in ab2_seats) / max(len(ab2_seats), 1)
+    return (seed, w, tag, game.turn_number, vps, nn_avg_vp, ab2_avg_vp,
+            nn_rank_sum, len(nn_seats))
 
 
 def resolve_weights(model):
@@ -351,6 +389,7 @@ def main():
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--seed-base", type=int, default=120000)
+    parser.add_argument("--mode", choices=["1v3", "2v2"], default="2v2")
     parser.add_argument("--ab-depth", type=int, default=1,
                         help="AB2 opponent search depth (1 = greedy, 2 = 2-ply)")
     parser.add_argument("--ab-value", action="store_true",
@@ -363,10 +402,14 @@ def main():
                         help="Opponent NN weights (if set, opponent uses NN instead of AB2)")
     parser.add_argument("--opp-depth", type=int, default=10,
                         help="Opponent NN search depth")
+    parser.add_argument("--heuristic", type=str, default=None,
+                        help="HPOL heuristic policy file. If set with --depth 0, uses it instead of NN.")
     args = parser.parse_args()
 
     wpath = args.weights if args.weights else resolve_weights(args.model)
     model_name = os.path.basename(wpath).replace("nn_weights_", "").replace(".bin", "") if args.weights else args.model
+    if args.heuristic:
+        model_name = os.path.basename(args.heuristic).replace("policy_heuristic_", "").replace(".bin", "")
     opp_wpath = args.opp_weights
     if opp_wpath and not os.path.exists(opp_wpath):
         opp_wpath = resolve_weights(opp_wpath)
@@ -380,25 +423,41 @@ def main():
     jobs = []
     for gi in range(args.games):
         seed = args.seed_base + gi
-        nn_s = [gi % 4, (gi + 2) % 4]
-        ab2_s = [(gi + 1) % 4, (gi + 3) % 4]
-        jobs.append((seed, nn_s, ab2_s, wpath, args.depth, args.ab_depth, args.ab_value, args.top_k, args.flat_k, opp_wpath, args.opp_depth))
+        if args.mode == "1v3":
+            nn_s = [gi % 4]
+            ab2_s = [s for s in range(4) if s != gi % 4]
+        else:
+            nn_s = [gi % 4, (gi + 2) % 4]
+            ab2_s = [(gi + 1) % 4, (gi + 3) % 4]
+        jobs.append((seed, nn_s, ab2_s, wpath, args.depth, args.ab_depth,
+                     args.ab_value, args.top_k, args.flat_k, opp_wpath,
+                     args.opp_depth, args.heuristic))
 
-    print(f"Running {args.games} games: {model_name} {depth_label} vs {ab_label} ({args.workers} workers)...",
+    print(f"Running {args.games} games: {model_name} {depth_label} vs {ab_label} "
+          f"({args.mode}, {args.workers} workers)...",
           flush=True)
     t0 = time.perf_counter()
     with mp.Pool(args.workers) as pool:
         results = pool.map(play_one, jobs)
     wall = time.perf_counter() - t0
 
-    nn_w = sum(1 for _, _, t, _ in results if t == "NN")
-    ab2_w = sum(1 for _, _, t, _ in results if t == "AB2")
+    nn_w = sum(1 for r in results if r[2] == "NN")
+    ab2_w = sum(1 for r in results if r[2] == "AB2")
+    draws = args.games - nn_w - ab2_w
+    nn_vp = sum(r[5] for r in results) / max(args.games, 1)
+    ab2_vp = sum(r[6] for r in results) / max(args.games, 1)
+    nn_rank = sum(r[7] for r in results) / max(sum(r[8] for r in results), 1)
+    avg_turns = sum(r[3] for r in results) / max(args.games, 1)
 
     print(f"\n{'='*50}")
-    print(f"  {model_name} {depth_label} vs {ab_label} — {args.games} games")
+    print(f"  {model_name} {depth_label} vs {ab_label} — {args.games} games ({args.mode})")
     print(f"{'='*50}")
     print(f"  {model_name:>12s} {depth_label}: {nn_w} wins ({100*nn_w/args.games:.0f}%)")
     print(f"  {ab_label:>14s}: {ab2_w} wins ({100*ab2_w/args.games:.0f}%)")
+    print(f"  Draws: {draws}")
+    print(f"  Avg VP: NN={nn_vp:.2f} AB2={ab2_vp:.2f}")
+    print(f"  Avg NN rank: {nn_rank:.2f}/4")
+    print(f"  Avg turns: {avg_turns:.1f}")
     print(f"  Wall time: {wall:.1f}s ({args.games/wall*60:.0f} games/min)")
 
 

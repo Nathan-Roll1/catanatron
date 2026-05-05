@@ -23,9 +23,10 @@ export OMP_NUM_THREADS=4
 # Keep CUDA on the first GPU SLURM gives us
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-# W&B (same key as ab2_imit_learn.sh)
-: "${WANDB_API_KEY:=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}"
-export WANDB_API_KEY
+# W&B — load from environment or ~/.wandb_key (never hardcode keys)
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.wandb_key" ]; then
+    export WANDB_API_KEY="$(cat "$HOME/.wandb_key")"
+fi
 
 echo "[launcher] Rebuilding libcatan on $(hostname)..."
 flock /nlp/scr/nroll/catan_training_big/.libcatan.lock \

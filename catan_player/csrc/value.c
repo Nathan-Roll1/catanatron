@@ -27,7 +27,7 @@ static const double VARIETY_BONUS = 4.0 * (2.778 / 100.0);
 
 static const double W2_CITY_DIST     = 1.15e7;
 static const double W2_SETTLE_DIST   = 9.0e6;
-static const double W2_DEV_DIST      = 6.0e6;
+static const double W2_DEV_DIST      = 8.0e6;
 static const double W2_ROAD_DIST     = 4.0e6;
 static const double W2_ROLL_PROGRESS = 2.4e7;
 static const double W2_DEV_TACTICAL  = 2.5e6;

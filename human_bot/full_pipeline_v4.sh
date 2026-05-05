@@ -25,8 +25,10 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 export GNN_HIDDEN=80
 export TRUNK_CHANNELS=192
 
-# W&B
-export WANDB_API_KEY="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"
+# W&B — load from environment or ~/.wandb_key
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.wandb_key" ]; then
+    export WANDB_API_KEY="$(cat "$HOME/.wandb_key")"
+fi
 
 # Data lives under catan_training; code lives under catan_training_big
 DATA_ROOT="/nlp/scr/nroll/catan_training"

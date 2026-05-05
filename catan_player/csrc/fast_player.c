@@ -113,7 +113,7 @@ static void hs_config_default(HSConfig *cfg) {
 }
 
 static void hs_plus_config_default(HSConfig *cfg) {
-    static const int k[] = {6, 4, 2, 2, 2, 2};
+    static const int k[] = {6, 5, 2, 2, 2, 2};
     memset(cfg, 0, sizeof(*cfg));
     cfg->depth = 6;
     cfg->k_len = (int)(sizeof(k) / sizeof(k[0]));
@@ -131,7 +131,7 @@ static void hs_plus_config_default(HSConfig *cfg) {
     cfg->policy_profile = 2;
     cfg->root_rollout = 0;
     cfg->root_ensemble = 0;
-    cfg->time_budget_sec = 5.0;
+    cfg->time_budget_sec = 3.5;
     cfg->root_workers = default_plus_workers();
 }
 
@@ -243,7 +243,8 @@ static bool configure_arena_variant(const char *name, ArenaVariant *out) {
         hs_config_default(&out->hs_cfg);
         return true;
     }
-    if (strcmp(name, "default") == 0 || strcmp(name, "leaf7-policy2") == 0) {
+    if (strcmp(name, "default") == 0 || strcmp(name, "leaf7-policy2") == 0 ||
+        strcmp(name, "keep-3p5s") == 0) {
         return true;
     }
     if (strcmp(name, "old-default") == 0) {

@@ -48,6 +48,7 @@ def human_policy_loss(
     label_smoothing: float = 0.05,
     action_weights: torch.Tensor | None = None,
     winner_boost: torch.Tensor | None = None,
+    example_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Label-smoothed cross-entropy over legal actions.
 
@@ -74,7 +75,9 @@ def human_policy_loss(
 
     if action_weights is not None:
         w = action_weights[action_idx]
-        return (per_example * w).mean()
+        per_example = per_example * w
+    if example_weights is not None:
+        per_example = per_example * example_weights
     return per_example.mean()
 
 
@@ -119,6 +122,82 @@ def masked_entropy(
     probs = log_probs.exp()
     ent = -(probs * log_probs * mask).sum(dim=-1)
     return torch.nan_to_num(ent, nan=0.0).mean()
+
+
+def awr_policy_loss(
+    logits: torch.Tensor,
+    action_idx: torch.Tensor,
+    mask: torch.Tensor,
+    advantages: torch.Tensor,
+    temperature: float = 2.0,
+    label_smoothing: float = 0.05,
+    max_weight: float = 20.0,
+) -> torch.Tensor:
+    """Advantage Weighted Regression: BC weighted by exp(advantage/temperature).
+
+    Stable alternative to PPO — same supervised loss as BC, but per-move
+    advantage weighting gives improvement pressure beyond imitation.
+    High temperature (~2-5) ≈ BC; low temperature (~0.1) ≈ greedy improvement.
+    """
+    fill_val = -6e4 if logits.dtype == torch.float16 else -1e9
+    masked_logits = logits.masked_fill(~mask.bool(), fill_val)
+
+    n_legal = mask.sum(dim=-1, keepdim=True).clamp(min=1)
+    one_hot = torch.zeros_like(logits).scatter_(1, action_idx.unsqueeze(1), 1.0)
+    smooth = (1.0 - label_smoothing) * one_hot + label_smoothing * (mask / n_legal)
+
+    log_probs = F.log_softmax(masked_logits, dim=-1)
+    per_example = -(smooth * log_probs).sum(dim=-1)
+
+    weights = torch.exp(advantages.detach() / temperature).clamp(max=max_weight)
+    return (per_example * weights).mean()
+
+
+def ppo_policy_loss(
+    logits: torch.Tensor,
+    action_idx: torch.Tensor,
+    mask: torch.Tensor,
+    log_prob_old: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_eps: float = 0.2,
+) -> torch.Tensor:
+    """PPO clipped surrogate objective.
+
+    Uses the importance ratio pi_new/pi_old clipped to [1-eps, 1+eps],
+    multiplied by advantages. Maximizes (negated for minimization).
+    """
+    fill_val = -6e4 if logits.dtype == torch.float16 else -1e9
+    masked_logits = logits.masked_fill(~mask.bool(), fill_val)
+    log_probs = F.log_softmax(masked_logits, dim=-1)
+    log_prob_new = log_probs.gather(1, action_idx.unsqueeze(1)).squeeze(1)
+
+    ratio = torch.exp(log_prob_new - log_prob_old)
+    adv = advantages.detach()
+
+    surr1 = ratio * adv
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
+    return -torch.min(surr1, surr2).mean()
+
+
+def value_loss_mse(
+    pred_logits: torch.Tensor,
+    returns: torch.Tensor,
+    turn_progress: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE value loss for RL training.
+
+    pred_logits: raw 4-d value logits (current player perspective).
+    returns: scalar return for the acting player (dim 0 of rotated reward).
+    """
+    pred = F.softmax(pred_logits, dim=-1)[:, 0]
+    per_example = (pred - returns.detach()) ** 2
+
+    if turn_progress is not None:
+        tp = turn_progress.detach().clamp(min=0.0)
+        max_tp = tp.max().clamp(min=1e-4)
+        weight = 0.2 + 0.8 * (tp / max_tp)
+        return (per_example * weight).mean()
+    return per_example.mean()
 
 
 class UncertaintyWeightedLoss(nn.Module):

@@ -140,3 +140,44 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# C/C++ build outputs and local debug artifacts
+*.o
+*.dylib
+*.dSYM/
+csrc/catanatron
+csrc/catanatron_prof
+csrc/test_*
+csrc/bench_*
+csrc/evo_*
+csrc/evolve*
+csrc/opt_*
+csrc/optimize*
+csrc/parallel_optimize
+csrc/ab2v3_*
+csrc/depth_*
+csrc/grid_search
+csrc/nn_selfplay
+csrc/prof
+csrc/road_port_1m
+csrc/spsa_paired
+csrc/stack_check
+csrc/strategy_search
+csrc/struct_*
+csrc/validate_*
+!csrc/*.c
+!csrc/*.h
+!csrc/Makefile
+catan_player/catan_player
+catan_player/bench/logs/
+
+# Local model exports, datasets, and experiment artifacts
+csrc/data_super_m2/
+csrc/nn_weights_*.bin
+csrc/policy_heuristic_*.bin
+csrc/*_weights*.bin
+csrc/test_encoder_output.bin
+csrc/*.jsonl
+csrc/*.html
+
+# Local experiment logs/artifacts
+wandb/

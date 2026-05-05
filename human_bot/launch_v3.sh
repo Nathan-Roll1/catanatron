@@ -25,7 +25,7 @@ echo "Done syncing."
 echo ""
 
 # ── Submit job ───────────────────────────────────────────────────
-WANDB_KEY="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"
+WANDB_KEY="${WANDB_API_KEY:-$(cat "$HOME/.wandb_key" 2>/dev/null || echo "")}"
 
 cat << 'SCRIPT_EOF'
 Submitting pipeline v3 job:

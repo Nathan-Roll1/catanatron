@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     ab2v3_asan50k
-relocations:     []
-...

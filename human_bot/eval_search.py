@@ -35,12 +35,17 @@ def evaluate_search_vs_ab2(
     temperature: float = 0.1,
     seed_offset: int = 0,
     nn_opponent: bool = False,
+    ab_value_leaf: bool = False,
 ) -> dict[str, int | float]:
     """Play games: 2 NN seats vs 2 AB2 seats with configurable search depth.
 
     search_depth=0: policy sampling, search_depth=1: 1-ply NN value greedy,
-    search_depth=2: our move + opponent response, then NN value eval.
+    search_depth=2: our move + opponent response, then value eval.
+
     nn_opponent: use NN value head for opponent model instead of base_value_fn.
+    ab_value_leaf: evaluate search leaves with AB2 base_value_fn instead of
+        the NN value head. Recommended for reliable external-style eval
+        while the NN value head is still being trained.
     """
     from hexzero.game.interface import CatanGame
     from hexzero.bindings.structs import (
@@ -178,6 +183,7 @@ def evaluate_search_vs_ab2(
                     g, le_to_use, hz_seats[idx], ab2_seats[idx], net, state_enc,
                     device, edge_index_dev, lib, search_depth, N, E, NF, EF, FF,
                     ch, ca, cn, nn_opponent=nn_opponent,
+                    ab_value_leaf=ab_value_leaf,
                 )
                 chosen = idx_map[chosen]
                 total_nn_calls += nn_calls
@@ -273,12 +279,17 @@ def _policy_sample(g, le, net, state_enc, action_enc, device,
 
 def _value_search(g, le, hz_seats_set, ab2_seats_set, net, state_enc,
                   device, edge_index_dev, lib, search_depth, N, E, NF, EF, FF,
-                  ch, ca, cn, top_k: int = 5, nn_opponent: bool = False):
-    """N-ply search: pick action maximising NN value head for our seat.
+                  ch, ca, cn, top_k: int = 5, nn_opponent: bool = False,
+                  ab_value_leaf: bool = False):
+    """N-ply search: pick action maximising value for our seat.
 
     For depth >= 2, restricts branching to top_k moves by policy score
     to keep computation tractable.  If nn_opponent=True, uses the NN
-    value head for opponent responses instead of base_value_fn.
+    value head for opponent responses instead of base_value_fn. If
+    ab_value_leaf=True, evaluates leaves with AB2 base_value_fn (from
+    our seat's perspective) instead of the NN value head — the NN value
+    head is often unreliable during training, so this keeps eval
+    external and stable.
     """
     our_seat = g.current_player()
 
@@ -325,12 +336,24 @@ def _value_search(g, le, hz_seats_set, ab2_seats_set, net, state_enc,
         if gc.is_terminal():
             terminal[bi] = 1.0
             w = gc.winner()
-            if w is not None and w == our_seat:
-                terminal_val[bi] = 10.0
-            elif w is not None:
-                terminal_val[bi] = -10.0
+            if ab_value_leaf:
+                # Use base_value_fn for terminals too so the scale matches
+                # the non-terminal AB-leaf values (~1e14). Otherwise the
+                # search would never prefer a terminal win over a "good"
+                # non-terminal position. base_value_fn naturally captures
+                # win/loss because the winner has VP=10 and losers <10.
+                cg = gc._game
+                bot_color = cg.state.colors[our_seat]
+                terminal_val[bi] = float(lib.base_value_fn(
+                    ctypes.byref(cg), bot_color))
             else:
-                terminal_val[bi] = 0.0
+                # NN-value path stays on the [-10, 10] scale
+                if w is not None and w == our_seat:
+                    terminal_val[bi] = 10.0
+                elif w is not None:
+                    terminal_val[bi] = -10.0
+                else:
+                    terminal_val[bi] = 0.0
         else:
             sv = gc.get_state_view()
             state_enc.encode_into(sv, nf_buf[non_terminal_count],
@@ -343,31 +366,65 @@ def _value_search(g, le, hz_seats_set, ab2_seats_set, net, state_enc,
 
     nn_calls = 0
     values = np.zeros((B, 4), dtype=np.float32)
+    ab_leaf_values = np.zeros(B, dtype=np.float64)  # scalar per leaf, from our seat
 
     if non_terminal_count > 0:
-        with torch.no_grad():
-            batch = {
-                "node_features": torch.from_numpy(nf_buf[:non_terminal_count].copy()).to(device),
-                "edge_index": edge_index_dev,
-                "edge_features": torch.from_numpy(ef_buf[:non_terminal_count].copy()).to(device),
-                "flat_features": torch.from_numpy(ff_buf[:non_terminal_count].copy()).to(device),
-                "action_mask": torch.from_numpy(mask_buf[:non_terminal_count].copy()).to(device),
-            }
-            out = net(batch)
-            raw_values = out["value"].cpu().numpy()
-        nn_calls = 1
-
-        vi = 0
-        for bi in range(B):
-            if terminal[bi] == 0:
-                values[bi] = raw_values[vi]
+        if ab_value_leaf:
+            # Evaluate each non-terminal leaf with AB2 base_value_fn from
+            # our seat's perspective. One C call per leaf; no GPU forward.
+            # We still need to track which non-terminal position was which
+            # original candidate.
+            vi = 0
+            for bi in range(B):
+                if terminal[bi] > 0:
+                    continue
+                # The candidate gc was rolled forward in-place earlier into
+                # the `gc` temp; we need to reconstruct it here. Cheapest:
+                # re-apply the candidate step + any responses into a fresh clone.
+                gc = g.clone()
+                gc.step(candidates[bi])
+                if search_depth >= 2 and not gc.is_terminal():
+                    cp = gc.current_player()
+                    if cp in ab2_seats_set:
+                        if nn_opponent:
+                            _nn_respond_any(gc, net, state_enc, device,
+                                           edge_index_dev, N, E, NF, EF, FF)
+                        else:
+                            _ab2_respond(gc, lib, ch, ca, cn)
+                if search_depth >= 3 and not gc.is_terminal():
+                    _nn_respond(gc, hz_seats_set, net, state_enc, device,
+                                edge_index_dev, N, E, NF, EF, FF, top_k)
+                cg = gc._game
+                bot_color = cg.state.colors[our_seat]
+                ab_leaf_values[bi] = float(lib.base_value_fn(
+                    ctypes.byref(cg), bot_color))
                 vi += 1
+        else:
+            with torch.no_grad():
+                batch = {
+                    "node_features": torch.from_numpy(nf_buf[:non_terminal_count].copy()).to(device),
+                    "edge_index": edge_index_dev,
+                    "edge_features": torch.from_numpy(ef_buf[:non_terminal_count].copy()).to(device),
+                    "flat_features": torch.from_numpy(ff_buf[:non_terminal_count].copy()).to(device),
+                    "action_mask": torch.from_numpy(mask_buf[:non_terminal_count].copy()).to(device),
+                }
+                out = net(batch)
+                raw_values = out["value"].cpu().numpy()
+            nn_calls = 1
+
+            vi = 0
+            for bi in range(B):
+                if terminal[bi] == 0:
+                    values[bi] = raw_values[vi]
+                    vi += 1
 
     best_bi = 0
     best_val = -1e30
     for bi in range(B):
         if terminal[bi] > 0:
             v = terminal_val[bi]
+        elif ab_value_leaf:
+            v = float(ab_leaf_values[bi])
         else:
             new_current = child_current[bi]
             offset = (our_seat - new_current) % 4

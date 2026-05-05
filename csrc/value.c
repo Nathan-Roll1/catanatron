@@ -5,6 +5,7 @@
 
 #include "value.h"
 #include <math.h>
+#include <stdlib.h>
 
 static const double DICE_P[13] = {
     0, 0,
@@ -66,6 +67,36 @@ static void compute_production(State *s, Color color, double *prod_out, int *var
 
     *prod_out = total;
     *variety_out = variety;
+}
+
+static double opponent_feature_value(Game *g, int idx) {
+    State *s = &g->state;
+    Color c = s->colors[idx];
+    double prod; int var;
+    compute_production(s, c, &prod, &var);
+    double production = prod + var * VARIETY_BONUS;
+
+    int *ps = s->player_state[idx];
+    int wheat = ps[PS_WHEAT_IN_HAND], ore = ps[PS_ORE_IN_HAND];
+    int sheep = ps[PS_SHEEP_IN_HAND], brick = ps[PS_BRICK_IN_HAND], wood = ps[PS_WOOD_IN_HAND];
+    double d_city = (fmax(2-wheat,0) + fmax(3-ore,0)) / 5.0;
+    double d_settle = (fmax(1-wheat,0) + fmax(1-sheep,0) + fmax(1-brick,0) + fmax(1-wood,0)) / 4.0;
+    double hand_synergy = (2 - d_city - d_settle) / 2.0;
+    int num_in_hand = wood + brick + sheep + wheat + ore;
+    int num_devs = ps[PS_KNIGHT_IN_HAND] + ps[PS_YEAR_OF_PLENTY_IN_HAND]
+                 + ps[PS_MONOPOLY_IN_HAND] + ps[PS_ROAD_BUILDING_IN_HAND]
+                 + ps[PS_VICTORY_POINT_IN_HAND];
+
+    return (double)(
+        ps[PS_VICTORY_POINTS] * W_VPS
+        + production * W_PROD
+        + hand_synergy * W_SYNERGY
+        + num_in_hand * W_HAND
+        + (num_in_hand > 7 ? W_DISCARD : 0)
+        + ps[PS_LONGEST_ROAD_LENGTH] * W_ROAD
+        + num_devs * W_DEVS
+        + ps[PS_PLAYED_KNIGHT] * W_ARMY
+    );
 }
 
 double base_value_fn(Game *g, Color p0_color) {
@@ -144,4 +175,99 @@ double base_value_fn(Game *g, Color p0_color) {
         + num_devs * W_DEVS
         + army * W_ARMY
     );
+}
+
+double base_value_fn_enemy_vp(Game *g, Color p0_color) {
+    double v = base_value_fn(g, p0_color);
+    State *s = &g->state;
+    double best = 0.0, second = 0.0;
+    for (int i = 0; i < s->num_players; i++) {
+        if (s->colors[i] == p0_color) continue;
+        double evp = (double)s->player_state[i][PS_VICTORY_POINTS];
+        if (evp > best) {
+            second = best;
+            best = evp;
+        } else if (evp > second) {
+            second = evp;
+        }
+    }
+    return v - (best + second) * (W_VPS / 10.0);
+}
+
+double base_value_fn_enemy_all_vp_prod(Game *g, Color p0_color) {
+    double v = base_value_fn(g, p0_color);
+    State *s = &g->state;
+    double pressure = 0.0;
+    for (int i = 0; i < s->num_players; i++) {
+        if (s->colors[i] == p0_color) continue;
+        double prod; int var;
+        compute_production(s, s->colors[i], &prod, &var);
+        pressure += s->player_state[i][PS_VICTORY_POINTS] * W_VPS
+                  + (prod + var * VARIETY_BONUS) * W_PROD;
+    }
+    return v - 0.10 * pressure;
+}
+
+double base_value_fn_enemy_leader(Game *g, Color p0_color) {
+    double v = base_value_fn(g, p0_color);
+    State *s = &g->state;
+    int leader = -1;
+    double best = -1e300;
+    for (int i = 0; i < s->num_players; i++) {
+        if (s->colors[i] == p0_color) continue;
+        double ev = opponent_feature_value(g, i);
+        if (ev > best) {
+            best = ev;
+            leader = i;
+        }
+    }
+    return leader >= 0 ? v - 0.10 * best : v;
+}
+
+/* Runtime-tunable knobs for the leaf_mode==4 path. Defaults match the
+ * original behavior so omitted env vars and direct callers see no change. */
+static double g_pressure_weight = 0.10;
+static double g_threat_bonus = 0.0;
+static int g_threat_vp_threshold = 100;
+static int g_value_env_checked = 0;
+
+static void value_check_env(void) {
+    if (g_value_env_checked) return;
+    g_value_env_checked = 1;
+    const char *pw = getenv("CATAN_LEAF_PRESSURE");
+    if (pw && pw[0]) g_pressure_weight = atof(pw);
+    const char *tb = getenv("CATAN_LEAF_THREAT_BONUS");
+    if (tb && tb[0]) g_threat_bonus = atof(tb);
+    const char *tt = getenv("CATAN_LEAF_THREAT_VP");
+    if (tt && tt[0]) g_threat_vp_threshold = atoi(tt);
+}
+
+void value_set_pressure_weight(double w) {
+    g_value_env_checked = 1;
+    g_pressure_weight = w;
+}
+
+void value_set_threat_bonus(double bonus, int vp_threshold) {
+    g_value_env_checked = 1;
+    g_threat_bonus = bonus;
+    g_threat_vp_threshold = vp_threshold;
+}
+
+double base_value_fn_enemy_full(Game *g, Color p0_color) {
+    value_check_env();
+    double v = base_value_fn(g, p0_color);
+    State *s = &g->state;
+    double pressure = 0.0;
+    int max_enemy_vp = 0;
+    for (int i = 0; i < s->num_players; i++) {
+        if (s->colors[i] == p0_color) continue;
+        pressure += opponent_feature_value(g, i);
+        int vp = s->player_state[i][PS_VICTORY_POINTS];
+        if (vp > max_enemy_vp) max_enemy_vp = vp;
+    }
+    double out = v - g_pressure_weight * pressure;
+    if (g_threat_bonus != 0.0 && max_enemy_vp >= g_threat_vp_threshold) {
+        out -= g_threat_bonus * W_VPS * (double)(max_enemy_vp - g_threat_vp_threshold + 1);
+    }
+    return out;
 }

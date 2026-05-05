@@ -59,20 +59,18 @@ _ACT_MOD[285:310] = 1.5
 _ACT_MOD[310:397] = 1.3
 
 
-def compute_step_weights(steps, reward_vec):
-    """M2 step-weight formula (matches c_selfplay.compute_step_weights):
-    upweight winner's later moves with a speed bonus, downweight loser noise."""
-    winner = int(np.argmax(reward_vec)) if reward_vec.max() > 0 else -1
+def compute_policy_weights(steps):
+    """Action-type-only policy-loss weights.
+
+    Deliberately NO winner-boost: AB2 targets are correct regardless of
+    game outcome, so upweighting "winner moves" would just concentrate
+    gradient on lucky trajectories instead of teaching AB2's policy. See
+    plan: robust-improvement-run.
+    """
     S = len(steps)
     weights = np.ones(S, dtype=np.float32)
-    speed_mult = 1.0 + max(0.0, min(0.5, (600 - S) / 600.0))
     for i, s in enumerate(steps):
-        progress = i / max(S - 1, 1)
-        if s["player"] == winner:
-            base = (1.0 + progress) * speed_mult
-        else:
-            base = max(0.2, 0.6 - 0.4 * progress)
-        weights[i] = base * _ACT_MOD[min(s["action_idx"], MASK_DIM - 1)]
+        weights[i] = _ACT_MOD[min(s["action_idx"], MASK_DIM - 1)]
     return weights
 
 
@@ -82,12 +80,20 @@ def atomic_torch_save(data, path):
     os.rename(tmp, path)
 
 
+SOURCE_TAG = "ab2"  # shard provenance for source-aware learner sampling
+
+
 def save_shard(games_data, output_dir, shard_id):
-    """Match c_selfplay.save_shard format exactly (incl. num_players field)."""
+    """Writes a shard in the shared c_selfplay format with:
+      - policy_weight: action-type-only weights (no winner boost)
+      - step_weight: legacy field, kept identical to policy_weight for
+        backwards compatibility with older learners
+      - source: shard provenance (bytes) so the learner can sample by source
+      - num_players: per-row real player count"""
     all_nf, all_ef, all_ff = [], [], []
-    all_mask, all_act, all_player, all_reward, all_sw = [], [], [], [], []
+    all_mask, all_act, all_player, all_reward, all_pw = [], [], [], [], []
     all_np = []
-    for steps, rv, sw, n_players in games_data:
+    for steps, rv, pw, n_players in games_data:
         for i, s in enumerate(steps):
             all_nf.append(s["nf"])
             all_ef.append(s["ef"])
@@ -96,10 +102,11 @@ def save_shard(games_data, output_dir, shard_id):
             all_act.append(s["action_idx"])
             all_player.append(s["player"])
             all_reward.append(rv)
-            all_sw.append(sw[i])
+            all_pw.append(pw[i])
             all_np.append(n_players)
     if not all_nf:
         return 0
+    pw_t = torch.tensor(all_pw, dtype=torch.float32)
     data = {
         "node_features": torch.from_numpy(np.stack(all_nf)),
         "edge_features": torch.from_numpy(np.stack(all_ef)),
@@ -108,8 +115,10 @@ def save_shard(games_data, output_dir, shard_id):
         "action_idx": torch.tensor(all_act, dtype=torch.int64),
         "player": torch.tensor(all_player, dtype=torch.int64),
         "reward_vec": torch.from_numpy(np.stack(all_reward)),
-        "step_weight": torch.tensor(all_sw, dtype=torch.float32),
+        "policy_weight": pw_t,
+        "step_weight": pw_t.clone(),  # legacy alias
         "num_players": torch.tensor(all_np, dtype=torch.int64),
+        "source": SOURCE_TAG,
     }
     atomic_torch_save(data, os.path.join(output_dir, f"{shard_id}.pt"))
     return len(all_nf)
@@ -245,8 +254,8 @@ def _run_actor(actor_id, shard_dir, seed_base, ab_depth, max_pending,
                     continue
                 vp = game._game.state.player_state[seat][0]
                 reward_vec[seat] = vp / 20.0
-        sw = compute_step_weights(steps, reward_vec)
-        return steps, reward_vec, sw, winner
+        pw = compute_policy_weights(steps)
+        return steps, reward_vec, pw, winner
 
     game_batch = []
     shard_idx = 0
@@ -256,22 +265,24 @@ def _run_actor(actor_id, shard_dir, seed_base, ab_depth, max_pending,
     games_by_pc = {int(pc): 0 for pc in pc_arr}
     t_start = time.time()
 
+    stop_file = os.path.join(shard_dir, ".stop")
+    ckpt_stop = os.path.join(os.path.dirname(shard_dir), "checkpoints", "exit_v2", ".stop")
     print(f"[ab2 actor {actor_id}] Started, depth={ab_depth}, "
           f"seed_base={seed_base}, player_counts={list(pc_arr)}, "
           f"max_pending={max_pending}", flush=True)
 
-    while True:
+    while not (os.path.exists(stop_file) or os.path.exists(ckpt_stop)):
         seed = seed_base + total_games
         n_players = int(rng.choice(pc_arr))
         games_by_pc[n_players] = games_by_pc.get(n_players, 0) + 1
-        steps, rv, sw, winner = play_game(seed, n_players)
+        steps, rv, pw, winner = play_game(seed, n_players)
 
         if not steps:
             # Game ended without any recorded multi-action steps (very rare).
             total_games += 1
             continue
 
-        game_batch.append((steps, rv, sw, n_players))
+        game_batch.append((steps, rv, pw, n_players))
         total_games += 1
         total_steps += len(steps)
         if winner is not None:

@@ -19,6 +19,22 @@ import torch.nn.functional as F
 log = logging.getLogger(__name__)
 
 
+class _GradScale(torch.autograd.Function):
+    """Scale gradient flowing backward without affecting forward pass."""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+def _scale_gradient(x: torch.Tensor, scale: float) -> torch.Tensor:
+    return _GradScale.apply(x, scale)
+
+
 # ======================================================================
 # Config
 # ======================================================================
@@ -334,6 +350,12 @@ class HumanBotNet(nn.Module):
         self.policy_head = SmallSpatialPolicyHead(cfg, road_pairs, tile_nodes)
         self.value_head = SmallValueHead(cfg.trunk_channels, cfg.value_head_hidden)
 
+        self.vp_head = nn.Sequential(
+            nn.Linear(cfg.trunk_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4),
+        )
+
         self._init_weights()
         log.info("HumanBotNet: %s params", f"{self.num_parameters:,}")
 
@@ -389,7 +411,8 @@ class HumanBotNet(nn.Module):
         trunk_out = self.trunk(combined)
 
         raw_logits = self.policy_head(trunk_out, node_emb)
-        value = self.value_head(trunk_out)
+        value = self.value_head(_scale_gradient(trunk_out, 0.1))
+        vp_pred = self.vp_head(_scale_gradient(trunk_out, 0.1))
 
         if mask is not None:
             fill_val = -6e4 if raw_logits.dtype == torch.float16 else -1e9
@@ -405,6 +428,7 @@ class HumanBotNet(nn.Module):
             "policy_logits": masked_logits,
             "policy_probs": policy_probs,
             "value": value,
+            "vp_pred": vp_pred,
         }
 
     @torch.inference_mode()
@@ -433,7 +457,7 @@ class HumanBotNet(nn.Module):
         ckpt = torch.load(path, map_location=device, weights_only=False)
         config = SmallNetworkConfig(**ckpt["config"])
         model = cls(config)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         model.to(device)
         model.eval()
         return model

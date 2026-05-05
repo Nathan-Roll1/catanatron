@@ -41,6 +41,18 @@ SearchResult alphabeta_search(SearchCtx *ctx, Game *g, Action *actions, int num_
                                Color bot_color, ValueFn eval_fn) {
     SearchResult result = {.value = 0, .action = {0}};
 
+    /* Same-turn early termination: when enabled, stop and eval as soon
+     * as another player becomes current. This is Python
+     * SameTurnAlphaBetaPlayer's defining property — we never try to
+     * predict opponent decisions, only evaluate the position we hand
+     * them at our turn-end. Avoids paranoid-minimax's fake-opponent
+     * bias that makes deeper plain alphabeta non-monotonic in this
+     * game. */
+    if (ctx->same_turn_mode && state_current_color(&g->state) != bot_color) {
+        result.value = eval_fn(g, bot_color);
+        return result;
+    }
+
     if (depth <= 0 || game_winning_color(g) != COLOR_NONE ||
         ctx->depth_counter >= MAX_SEARCH_DEPTH) {
         result.value = eval_fn(g, bot_color);
@@ -52,7 +64,12 @@ SearchResult alphabeta_search(SearchCtx *ctx, Game *g, Action *actions, int num_
     int pool_idx = ctx->depth_counter++;
     Game *child = &ctx->pool[pool_idx];
     Action *child_actions = ctx->actions[pool_idx];
-    bool maximizing = (state_current_color(&g->state) == bot_color);
+    /* In same-turn mode we already asserted current == bot above, so
+     * maximizing is unconditionally true. For plain alphabeta we fall
+     * back to the usual minimax decision. */
+    bool maximizing = ctx->same_turn_mode
+        ? true
+        : (state_current_color(&g->state) == bot_color);
 
     if (maximizing) {
         result.value = -1e30;
@@ -192,6 +209,19 @@ static double eval_action_expected(SearchCtx *ctx, Game *g, Action a,
                                         child_depth, alpha, beta,
                                         bot_color, eval_fn);
     return sr.value;
+}
+
+SearchResult alphabeta_search_same_turn(SearchCtx *ctx, Game *g, Action *actions,
+                                         int num_actions, int depth,
+                                         double alpha, double beta,
+                                         Color bot_color, ValueFn eval_fn) {
+    /* Save/restore flag so nested calls don't leak state. */
+    int prev = ctx->same_turn_mode;
+    ctx->same_turn_mode = 1;
+    SearchResult r = alphabeta_search(ctx, g, actions, num_actions, depth,
+                                       alpha, beta, bot_color, eval_fn);
+    ctx->same_turn_mode = prev;
+    return r;
 }
 
 Action random_player_decide(State *s, Action *actions, int n, RngState *rng) {

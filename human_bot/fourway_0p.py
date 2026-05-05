@@ -3,6 +3,9 @@
 
 Usage:
     python -u human_bot/fourway_0p.py --games 1000 --workers 16
+    python -u human_bot/fourway_0p.py --model original=csrc/nn_weights_m2.bin \
+        --model incumbent=csrc/nn_weights_candidate.bin --model keepA=... \
+        --model keepB=... --games 1000 --workers 16
 """
 
 import argparse
@@ -91,21 +94,44 @@ def play_one(args):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        help="Model as label=weights.bin. Provide exactly four to override defaults.",
+    )
     parser.add_argument("--games", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--seed-base", type=int, default=150000)
     parser.add_argument("--rng-seed", type=int, default=42)
     args = parser.parse_args()
 
+    models = list(MODELS)
+    if args.model:
+        if len(args.model) != 4:
+            raise SystemExit("--model override requires exactly four label=path values")
+        models = []
+        for spec in args.model:
+            if "=" not in spec:
+                raise SystemExit(f"Bad --model value {spec!r}; expected label=path")
+            label, path = spec.split("=", 1)
+            label = label.strip()
+            path = os.path.abspath(os.path.expanduser(path.strip()))
+            if not label:
+                raise SystemExit(f"Bad --model value {spec!r}; empty label")
+            if not os.path.exists(path):
+                raise SystemExit(f"Model path does not exist for {label}: {path}")
+            models.append((label, path))
+
     rng = random.Random(args.rng_seed)
     jobs = []
     for gi in range(args.games):
         seed = args.seed_base + gi
-        order = list(MODELS)
+        order = list(models)
         rng.shuffle(order)
         jobs.append((seed, order))
 
-    names = [m[0] for m in MODELS]
+    names = [m[0] for m in models]
     print(f"4-way 0-ply: {', '.join(names)} — {args.games} games, {args.workers} workers",
           flush=True)
 

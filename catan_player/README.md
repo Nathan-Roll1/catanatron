@@ -16,8 +16,8 @@ This repo exposes exactly four agents:
 ./build.sh
 ```
 
-The build produces `./catan_player`. `H-S` and `AB2` do not use neural network
-inference. The only runtime data file is `weights/model.bin`, needed by
+The build produces `./catan_player`. `H-S`, `H-S+`, and `AB2` do not use neural
+network inference. The only runtime data file is `weights/model.bin`, needed by
 `m2_0ply`.
 
 ## Run
@@ -84,20 +84,16 @@ The old internal name for this setup was `leaf0_search`; `h-s`, `hs`,
 
 ## H-S+
 
-`H-S+` is the single-game optimized variant for machines with many cores. Its
-default config keeps the same depth and K schedule as `H-S`, evaluates root
-candidates in parallel, uses the FFA leader-heavy known-future Leaf7 evaluator
-with opening-aware policy profile 2, and models opponents with deterministic AB2
-so copied `Game.rng` drives exact future rolls, development-card draws, and
-robber steals instead of expectimax chance nodes.
-
-On an 18-core Apple Silicon machine, seed `810000` self-play dropped from
-about `6.65s` with `H-S` to about `2.0s` with `H-S+`, with the same winner and
-final VP vector.
+`H-S+` is the retained `keep-3p5s` single-game optimized variant. Its default
+config uses depth `6`, K schedule `6,5,2,2,2,2`, parallel root evaluation,
+the FFA leader-heavy known-future Leaf7 evaluator, opening-aware policy profile
+`2`, deterministic AB2 opponent modeling, and a `3.5s` per-decision search
+budget. Copied `Game.rng` state drives exact future rolls, development-card
+draws, and robber steals instead of expectimax chance nodes.
 
 Current FFA default validation:
 
-- Promoted default (`Leaf7 + policy2`) vs old default (`Leaf5 + policy1`),
+- Retained default (`keep-3p5s`) vs old default (`Leaf5 + policy1`),
   seeds `980000,981000,982000,983000,984000,985000,986000,987000`, four games
   per seed block:
   - vs `H-S`: new default `15-17`, old default `12-20`

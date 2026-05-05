@@ -1,6 +1,7 @@
 import time
 import random
 import multiprocessing
+import pickle
 from collections import Counter
 
 from catanatron.game import Game
@@ -59,13 +60,28 @@ def run_playouts(action_applied_game_copy, num_playouts):
     for _ in range(num_playouts):
         params.append(action_applied_game_copy)
     if USE_MULTIPROCESSING:
-        with multiprocessing.Pool(NUM_WORKERS) as p:
-            counter = Counter(p.map(run_playout, params))
+        try:
+            with multiprocessing.Pool(NUM_WORKERS) as p:
+                counter = Counter(p.map(run_playout, params))
+        except (AttributeError, TypeError, pickle.PicklingError) as exc:
+            if not _is_multiprocessing_pickling_error(exc):
+                raise
+            counter = Counter(map(run_playout, params))
     else:
         counter = Counter(map(run_playout, params))
     duration = time.time() - start
     # print(f"{num_playouts} playouts took: {duration}. Results: {counter}")
     return counter
+
+
+def _is_multiprocessing_pickling_error(exc):
+    text = str(exc).lower()
+    return (
+        "pickle" in text
+        or "pickling" in text
+        or "can't get local object" in text
+        or "cannot pickle" in text
+    )
 
 
 def run_playout(action_applied_game_copy):

@@ -169,6 +169,7 @@ def simulate(
 @dataclass(frozen=True)
 class OutputOptions:
     output: Union[str, None] = None
+    output_format: str = "json"
 
 
 @dataclass(frozen=True)

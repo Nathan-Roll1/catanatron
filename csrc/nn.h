@@ -4,12 +4,18 @@
 #include <stdint.h>
 
 /* Architecture constants (must match export) */
+/* Set for the ~1M param model (GNN_HIDDEN=80, TRUNK_CHANNELS=192). */
+/* The 602k model (64/128) also works if compiled with those values. */
 #define NN_NODES        54
 #define NN_MAX_EDGES    144
-#define NN_GNN_HIDDEN   64
+#ifndef NN_GNN_HIDDEN
+#define NN_GNN_HIDDEN   80
+#endif
 #define NN_GNN_OUTPUT   128
 #define NN_GNN_LAYERS   4
-#define NN_TRUNK_CH     128
+#ifndef NN_TRUNK_CH
+#define NN_TRUNK_CH     192
+#endif
 #define NN_TRUNK_BLOCKS 6
 #define NN_VALUE_HIDDEN 128
 #define NN_FLAT_DIM     115
@@ -59,6 +65,27 @@ typedef struct {
     float fc2_b[NN_VALUE_HIDDEN];
     BNV bn2;
 } ValResBlockWeights;
+
+typedef struct {
+    int8_t msg_w1[NN_GNN_HIDDEN][3*NN_GNN_HIDDEN];
+    int8_t msg_w2[NN_GNN_HIDDEN][NN_GNN_HIDDEN];
+    int8_t upd_w1[NN_GNN_HIDDEN][2*NN_GNN_HIDDEN];
+    int8_t upd_w2[NN_GNN_HIDDEN][NN_GNN_HIDDEN];
+    float msg_w1_s[NN_GNN_HIDDEN], msg_w2_s[NN_GNN_HIDDEN];
+    float upd_w1_s[NN_GNN_HIDDEN], upd_w2_s[NN_GNN_HIDDEN];
+} EdgeConvWeightsI8;
+
+typedef struct {
+    int8_t fc1_w[NN_TRUNK_CH][NN_TRUNK_CH];
+    int8_t fc2_w[NN_TRUNK_CH][NN_TRUNK_CH];
+    float fc1_s[NN_TRUNK_CH], fc2_s[NN_TRUNK_CH];
+} ResBlockWeightsI8;
+
+typedef struct {
+    int8_t fc1_w[NN_VALUE_HIDDEN][NN_VALUE_HIDDEN];
+    int8_t fc2_w[NN_VALUE_HIDDEN][NN_VALUE_HIDDEN];
+    float fc1_s[NN_VALUE_HIDDEN], fc2_s[NN_VALUE_HIDDEN];
+} ValResBlockWeightsI8;
 
 typedef struct {
     /* Topology */
@@ -126,6 +153,38 @@ typedef struct {
     float pol_rob_w1[NN_SCORER_HIDDEN][NN_TRUNK_CH+NN_GNN_HIDDEN]; float pol_rob_b1[NN_SCORER_HIDDEN];
     float pol_rob_w2[5][NN_SCORER_HIDDEN]; float pol_rob_b2[5];
 
+    /* Packed int8 weights for experimental dynamic-activation int8 compute. */
+    int compute_i8;
+    int compute_i8_batch;
+    int8_t node_proj_w_i8[NN_GNN_HIDDEN][NN_NODE_FEAT]; float node_proj_w_s[NN_GNN_HIDDEN];
+    int8_t edge_proj_w_i8[NN_GNN_HIDDEN][NN_EDGE_FEAT]; float edge_proj_w_s[NN_GNN_HIDDEN];
+    EdgeConvWeightsI8 gnn_layers_i8[NN_GNN_LAYERS];
+    int8_t out_proj_w1_i8[NN_GNN_OUTPUT][2*NN_GNN_HIDDEN]; float out_proj_w1_s[NN_GNN_OUTPUT];
+    int8_t out_proj_w2_i8[NN_GNN_OUTPUT][NN_GNN_OUTPUT]; float out_proj_w2_s[NN_GNN_OUTPUT];
+
+    int8_t trunk_ip_w_i8[NN_TRUNK_CH][NN_TRUNK_INPUT]; float trunk_ip_w_s[NN_TRUNK_CH];
+    ResBlockWeightsI8 trunk_blocks_i8[NN_TRUNK_BLOCKS];
+
+    int8_t val_fc1_w_i8[NN_VALUE_HIDDEN][NN_TRUNK_CH]; float val_fc1_w_s[NN_VALUE_HIDDEN];
+    ValResBlockWeightsI8 val_res_i8[2];
+    int8_t val_out_w_i8[4][NN_VALUE_HIDDEN]; float val_out_w_s[4];
+
+    int8_t pol_type_w1_i8[NN_POLICY_HIDDEN][NN_TRUNK_CH]; float pol_type_w1_s[NN_POLICY_HIDDEN];
+    int8_t pol_type_w2_i8[NN_NUM_TYPES][NN_POLICY_HIDDEN]; float pol_type_w2_s[NN_NUM_TYPES];
+    int8_t pol_dym_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH]; float pol_dym_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_dym_w2_i8[30][NN_SCORER_HIDDEN]; float pol_dym_w2_s[30];
+    int8_t pol_mar_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH]; float pol_mar_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_mar_w2_i8[20][NN_SCORER_HIDDEN]; float pol_mar_w2_s[20];
+    int8_t pol_trd_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH]; float pol_trd_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_trd_w2_i8[67][NN_SCORER_HIDDEN]; float pol_trd_w2_s[67];
+    int8_t pol_sett_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH+NN_GNN_HIDDEN]; float pol_sett_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_sett_w2_i8[1][NN_SCORER_HIDDEN]; float pol_sett_w2_s[1];
+    int8_t pol_city_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH+NN_GNN_HIDDEN]; float pol_city_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_city_w2_i8[1][NN_SCORER_HIDDEN]; float pol_city_w2_s[1];
+    int8_t pol_road_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH+2*NN_GNN_HIDDEN]; float pol_road_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_road_w2_i8[1][NN_SCORER_HIDDEN]; float pol_road_w2_s[1];
+    int8_t pol_rob_w1_i8[NN_SCORER_HIDDEN][NN_TRUNK_CH+NN_GNN_HIDDEN]; float pol_rob_w1_s[NN_SCORER_HIDDEN];
+    int8_t pol_rob_w2_i8[5][NN_SCORER_HIDDEN]; float pol_rob_w2_s[5];
 } NNModel;
 
 /* Inference output */
@@ -152,5 +211,13 @@ void nn_value_only(const NNModel *m,
                    const float flat_feat[NN_FLAT_DIM],
                    const float mask[NN_MASK_DIM],
                    float value_out[4]);
+
+/* Policy-only forward (skips value head, fastest for play). */
+void nn_policy_only(const NNModel *m,
+                    const float node_feat[NN_NODES][NN_NODE_FEAT],
+                    const float edge_feat[NN_MAX_EDGES][NN_EDGE_FEAT],
+                    const float flat_feat[NN_FLAT_DIM],
+                    const float mask[NN_MASK_DIM],
+                    float policy_out[NN_MASK_DIM]);
 
 #endif

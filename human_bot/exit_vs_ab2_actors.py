@@ -54,19 +54,17 @@ _ACT_MOD[285:310] = 1.5
 _ACT_MOD[310:397] = 1.3
 
 
-def compute_step_weights(steps, reward_vec):
-    """M2 step-weight formula (matches exit_gpu_actors / ab2_stream)."""
-    winner = int(np.argmax(reward_vec)) if reward_vec.max() > 0 else -1
+def compute_policy_weights(steps):
+    """Action-type-only policy-loss weights (no winner-boost).
+
+    In 1-NN-vs-AB2 games we record only the NN seat's decisions; they are
+    search-improved targets, not outcome votes, so winner-boosting would
+    just add noise. See plan: robust-improvement-run.
+    """
     S = len(steps)
     weights = np.ones(S, dtype=np.float32)
-    speed_mult = 1.0 + max(0.0, min(0.5, (600 - S) / 600.0))
     for i, s in enumerate(steps):
-        progress = i / max(S - 1, 1)
-        if s["player"] == winner:
-            base = (1.0 + progress) * speed_mult
-        else:
-            base = max(0.2, 0.6 - 0.4 * progress)
-        weights[i] = base * _ACT_MOD[min(s["action_idx"], MASK_DIM - 1)]
+        weights[i] = _ACT_MOD[min(s["action_idx"], MASK_DIM - 1)]
     return weights
 
 
@@ -82,12 +80,15 @@ def atomic_torch_save(data, path):
     os.rename(tmp, path)
 
 
+SOURCE_TAG = "exit_vs_ab2"  # shard provenance for source-aware learner sampling
+
+
 def save_shard(games_data, output_dir, shard_id):
-    """Same shard format as c_selfplay / ab2_stream / exit_gpu_actors."""
+    """c_selfplay shard format + policy_weight + source metadata."""
     all_nf, all_ef, all_ff = [], [], []
-    all_mask, all_act, all_player, all_reward, all_sw = [], [], [], [], []
+    all_mask, all_act, all_player, all_reward, all_pw = [], [], [], [], []
     all_np = []
-    for steps, rv, sw, n_players in games_data:
+    for steps, rv, pw, n_players in games_data:
         for i, s in enumerate(steps):
             all_nf.append(s["nf"])
             all_ef.append(s["ef"])
@@ -96,10 +97,11 @@ def save_shard(games_data, output_dir, shard_id):
             all_act.append(s["action_idx"])
             all_player.append(s["player"])
             all_reward.append(rv)
-            all_sw.append(sw[i])
+            all_pw.append(pw[i])
             all_np.append(n_players)
     if not all_nf:
         return 0
+    pw_t = torch.tensor(all_pw, dtype=torch.float32)
     data = {
         "node_features": torch.from_numpy(np.stack(all_nf)),
         "edge_features": torch.from_numpy(np.stack(all_ef)),
@@ -108,8 +110,10 @@ def save_shard(games_data, output_dir, shard_id):
         "action_idx": torch.tensor(all_act, dtype=torch.int64),
         "player": torch.tensor(all_player, dtype=torch.int64),
         "reward_vec": torch.from_numpy(np.stack(all_reward)),
-        "step_weight": torch.tensor(all_sw, dtype=torch.float32),
+        "policy_weight": pw_t,
+        "step_weight": pw_t.clone(),  # legacy alias
         "num_players": torch.tensor(all_np, dtype=torch.int64),
+        "source": SOURCE_TAG,
     }
     atomic_torch_save(data, os.path.join(output_dir, f"{shard_id}.pt"))
     return len(all_nf)
@@ -135,6 +139,8 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+    print(f"[exit_vs_ab2 actor {actor_id}] startup: importing deps",
+          flush=True)
     from hexzero.config import GameConfig
     from hexzero.game.interface import CatanGame
     from hexzero.encoder.action_encoder import ActionEncoder
@@ -145,6 +151,8 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     from human_bot.model import HumanBotNet
     from human_bot.search_heuristics import apply_action_bonus, fix_robber_steal
 
+    print(f"[exit_vs_ab2 actor {actor_id}] startup: loading libcatan",
+          flush=True)
     lib = load_library()
     ae = ActionEncoder()
     eval_fn = ValueFn(lib.base_value_fn)
@@ -152,9 +160,24 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     ab_buf = (CAction * MAX_ACTIONS)()
 
     device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+    print(f"[exit_vs_ab2 actor {actor_id}] startup: cuda_available="
+          f"{torch.cuda.is_available()} device={device}", flush=True)
+    if torch.cuda.is_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(gpu_id)
+            print(f"[exit_vs_ab2 actor {actor_id}] startup: gpu{gpu_id} mem "
+                  f"free={free_b/1e9:.2f}G / total={total_b/1e9:.2f}G",
+                  flush=True)
+        except Exception as e:
+            print(f"[exit_vs_ab2 actor {actor_id}] mem_get_info failed: {e}",
+                  flush=True)
+    print(f"[exit_vs_ab2 actor {actor_id}] startup: loading checkpoint "
+          f"{ckpt_path}", flush=True)
     net = HumanBotNet.load_checkpoint(ckpt_path, device=device)
     net.eval()
     weights_mtime = os.path.getmtime(ckpt_path)
+    print(f"[exit_vs_ab2 actor {actor_id}] startup: model on {device}, "
+          f"params={net.num_parameters:,}", flush=True)
 
     g0 = CatanGame(seed=0); g0.reset()
     se = g0.make_state_encoder()
@@ -281,6 +304,10 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
         bot_color = cg.state.colors[our_seat]
         return float(lib.base_value_fn(ctypes.byref(cg), bot_color))
 
+    # See exit_gpu_actors.py for semantics.
+    search_stats = {"calls": 0, "agree": 0, "degenerate": 0,
+                    "spread_sum": 0.0}
+
     # ── ExIt search (NN policy + batched argmax rollout + AB2 leaf) ──
     def abt_search(game, le, depth, temperature):
         """Returns (target_action, played_action). Target = search argmax
@@ -313,17 +340,12 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
                 if gc.is_terminal() or gc.turn_number >= MAX_TURNS:
                     alive[p] = False
 
-        values = np.zeros(K, dtype=np.float32)
+        # See exit_gpu_actors.py for rationale on fp64 + scale fix +
+        # temperature normalization. Same bug, same fix.
+        values = np.zeros(K, dtype=np.float64)
         for p in range(K):
             gc = clones[p]
-            if gc.is_terminal():
-                w = gc.winner()
-                v = 10.0 if (w is not None and w == seat) else (
-                    -10.0 if w is not None else 0.0)
-            else:
-                v = ab_leaf_eval(gc, seat)
-            v = apply_action_bonus(v, le[cands[p]])
-            values[p] = v
+            values[p] = ab_leaf_eval(gc, seat)
 
         argmax_p = int(np.argmax(values))
         target_action = fix_robber_steal(cands[argmax_p], le)
@@ -331,11 +353,23 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
         if K == 1 or temperature < 0.01:
             played_p = argmax_p
         else:
-            shifted = values - values.max()
-            probs = np.exp(shifted / temperature)
+            v_max = values.max()
+            v_min = values.min()
+            spread = max(1.0, v_max - v_min)
+            normalized = (values - v_max) / spread
+            probs = np.exp(normalized / max(0.01, temperature))
             probs /= probs.sum()
             played_p = int(np.random.choice(K, p=probs))
         played_action = fix_robber_steal(cands[played_p], le)
+
+        # See exit_gpu_actors.py for diagnostic semantics.
+        search_stats["calls"] += 1
+        if argmax_p == 0:
+            search_stats["agree"] += 1
+        v_spread = float(values.max() - values.min())
+        if v_spread < 1e-3:
+            search_stats["degenerate"] += 1
+        search_stats["spread_sum"] += v_spread
 
         return target_action, played_action
 
@@ -403,8 +437,8 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
                 if s == winner: continue
                 vp = game._game.state.player_state[s][0]
                 reward_vec[s] = vp / 20.0
-        sw = compute_step_weights(steps, reward_vec)
-        return steps, reward_vec, sw, winner
+        pw = compute_policy_weights(steps)
+        return steps, reward_vec, pw, winner
 
     # ── Actor loop ──────────────────────────────────────────────────
     game_batch = []
@@ -415,18 +449,19 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
     games_by_pc = {int(pc): 0 for pc in pc_arr}
     t_start = time.time()
 
+    stop_file = os.path.join(ckpt_dir, ".stop")
     print(f"[exit_vs_ab2 actor {actor_id}] Started on {device}, "
           f"depth={search_depth} top-k={top_k} pcs={list(pc_arr)} "
           f"max_pending={max_pending}", flush=True)
 
-    while True:
+    while not os.path.exists(stop_file):
         cur_round = get_round()
         temp = temperature_for_round(cur_round)
         seed = (actor_id + 1) * 1_000_000 + total_games
         n_players = int(rng.choice(pc_arr))
         nn_seat = int(rng.integers(0, n_players))  # rotate NN seat each game
         games_by_pc[n_players] += 1
-        steps, rv, sw, winner = play_one_game(seed, n_players, nn_seat, temp)
+        steps, rv, pw, winner = play_one_game(seed, n_players, nn_seat, temp)
         if winner is not None and winner == nn_seat:
             nn_wins += 1
 
@@ -434,7 +469,7 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             total_games += 1
             continue
 
-        game_batch.append((steps, rv, sw, n_players))
+        game_batch.append((steps, rv, pw, n_players))
         total_games += 1
         total_steps += len(steps)
 
@@ -443,6 +478,16 @@ def _run_actor(actor_id, gpu_id, ckpt_path, shard_dir, ckpt_dir,
             save_shard(game_batch, pending_dir, sid)
             game_batch = []
             shard_idx += 1
+
+            sc = search_stats["calls"] or 1
+            print(f"[exit_vs_ab2 actor {actor_id}] search_diag: "
+                  f"calls={search_stats['calls']} "
+                  f"agree_pct={100*search_stats['agree']/sc:.1f} "
+                  f"degen_pct={100*search_stats['degenerate']/sc:.1f} "
+                  f"avg_spread={search_stats['spread_sum']/sc:.2e}",
+                  flush=True)
+            search_stats = {"calls": 0, "agree": 0, "degenerate": 0,
+                            "spread_sum": 0.0}
             while True:
                 try:
                     n_pending = len([f for f in os.listdir(pending_dir)

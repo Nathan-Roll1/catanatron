@@ -440,7 +440,6 @@ void build_map(CatanMap *map, int map_type, int number_placement, RngState *rng)
 
         int num_idx = 0;
         for (int s = 0; s < spiral.count; s++) {
-            /* Find which land tile has this coordinate */
             for (int i = 0; i < map->num_land_tiles; i++) {
                 if (coord_eq(map->land_tile_coords[i], spiral.coords[s])) {
                     if (map->land_tiles[i].resource != RES_NONE) {
@@ -449,6 +448,42 @@ void build_map(CatanMap *map, int map_type, int number_placement, RngState *rng)
                     break;
                 }
             }
+        }
+    }
+
+    /* Random balanced: reshuffle numbers until no 6/8 adjacency */
+    if (number_placement == NPLACE_RANDOM_BALANCED && map_type != MAP_TOURNAMENT) {
+        for (int attempt = 0; attempt < 1000; attempt++) {
+            /* Reshuffle numbers onto non-desert land tiles */
+            int nums[32];
+            int nn = 0;
+            for (int i = 0; i < map->num_land_tiles; i++)
+                if (map->land_tiles[i].resource != RES_NONE)
+                    nums[nn++] = map->land_tiles[i].number;
+            int tmp[32];
+            rng_sample_int(rng, nums, nn, tmp, nn);
+            memcpy(nums, tmp, nn * sizeof(int));
+            int ni = 0;
+            for (int i = 0; i < map->num_land_tiles; i++)
+                if (map->land_tiles[i].resource != RES_NONE)
+                    map->land_tiles[i].number = nums[ni++];
+
+            /* Check 6/8 adjacency: two tiles are adjacent if they share a node */
+            int ok = 1;
+            for (int i = 0; i < map->num_land_tiles && ok; i++) {
+                int ni_val = map->land_tiles[i].number;
+                if (ni_val != 6 && ni_val != 8) continue;
+                for (int j = i + 1; j < map->num_land_tiles && ok; j++) {
+                    int nj_val = map->land_tiles[j].number;
+                    if (nj_val != 6 && nj_val != 8) continue;
+                    /* Check if tiles i and j share any node */
+                    for (int a = 0; a < 6 && ok; a++)
+                        for (int b = 0; b < 6 && ok; b++)
+                            if (map->land_tiles[i].nodes[a] == map->land_tiles[j].nodes[b])
+                                ok = 0;
+                }
+            }
+            if (ok) break;
         }
     }
 

@@ -33,7 +33,7 @@ from human_bot.loss import UncertaintyWeightedLoss
 from human_bot.model import HumanBotNet, SmallNetworkConfig
 from human_bot.train import DeviceDataset, build_cosine_scheduler, train_epoch
 
-WANDB_KEY = "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"
+WANDB_KEY = os.environ.get("WANDB_API_KEY", "")
 
 
 def detect_device() -> str:

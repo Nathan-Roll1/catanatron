@@ -146,6 +146,7 @@ MAP_TOURNAMENT = 2
 
 NPLACE_OFFICIAL_SPIRAL = 0
 NPLACE_RANDOM = 1
+NPLACE_RANDOM_BALANCED = 2
 
 # ---------------------------------------------------------------------------
 # Struct definitions — declaration order mirrors the C header dependency chain
@@ -300,6 +301,7 @@ class SearchCtx(Structure):
         ("pool", Game * MAX_SEARCH_DEPTH),
         ("actions", (Action * MAX_ACTIONS) * MAX_SEARCH_DEPTH),
         ("depth_counter", c_int),
+        ("same_turn_mode", c_int),
         ("user_data", c_void_p),
     ]
 

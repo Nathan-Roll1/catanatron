@@ -320,14 +320,12 @@ def apply_discard(state: State, action: Action):
         # state.current_prompt stays the same
         pass
     else:
-        next_discarder_index = next(
-            (
-                i
-                for i in range(state.current_player_index + 1, len(state.colors))
-                if state.discard_counts[i] > 0
-            ),
-            None,
-        )
+        next_discarder_index = None
+        for offset in range(1, len(state.colors)):
+            i = (player_index + offset) % len(state.colors)
+            if state.discard_counts[i] > 0:
+                next_discarder_index = i
+                break
         if next_discarder_index is not None:
             state.current_player_index = next_discarder_index
             # state.current_prompt stays the same

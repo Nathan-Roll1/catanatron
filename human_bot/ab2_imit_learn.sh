@@ -10,9 +10,10 @@ export GNN_HIDDEN=80
 export TRUNK_CHANNELS=192
 
 # W&B: same key that's hard-coded in human_bot/cluster_train_inner.py.
-# nlprun does not inherit the caller's environment, so set it here.
-: "${WANDB_API_KEY:=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}"
-export WANDB_API_KEY
+# W&B — load from environment or ~/.wandb_key (never hardcode keys)
+if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$HOME/.wandb_key" ]; then
+    export WANDB_API_KEY="$(cat "$HOME/.wandb_key")"
+fi
 
 # Rebuild libcatan for this node's CPU (-march=native was built elsewhere
 # → "Illegal instruction" on jag nodes with different SIMD support).

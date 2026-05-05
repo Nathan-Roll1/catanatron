@@ -154,6 +154,9 @@ def _bind_search(lib: ctypes.CDLL) -> None:
     ]
     lib.alphabeta_search.restype = SearchResult
 
+    lib.alphabeta_search_same_turn.argtypes = lib.alphabeta_search.argtypes
+    lib.alphabeta_search_same_turn.restype = SearchResult
+
     lib.apply_action.argtypes = [POINTER(State), Action, POINTER(RngState)]
     lib.apply_action.restype = None
 

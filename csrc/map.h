@@ -58,5 +58,6 @@ void build_map(CatanMap *map, int map_type, int number_placement, RngState *rng)
 /* number_placement constants */
 #define NPLACE_OFFICIAL_SPIRAL 0
 #define NPLACE_RANDOM          1
+#define NPLACE_RANDOM_BALANCED 2
 
 #endif

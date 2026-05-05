@@ -285,23 +285,35 @@ class StateEncoder:
         if len(rt):
             nf[self._ltiles[rt[0]], 17] = 1.0
 
+        # Determine real player count (same logic used by flat-feature block
+        # below) so the edge "enemy road" channels match the flat convention
+        # in mixed 2/3/4-player games.
+        n_real = int(getattr(state, "num_players", NUM_PLAYERS))
+        if n_real <= 0 or n_real > NUM_PLAYERS:
+            n_real = NUM_PLAYERS
+
         # ── edge features (E, 5) ─────────────────────────────────────
         rc_raw = state.road_owners[self._road_src, self._road_adj]  # Color enum
         # Map Color -> seat index for road owners
         rc_arr = np.where(rc_raw >= 0, c2i[rc_raw.clip(0, 3)], -1)  # seat index
         ef[:, 0] = rc_arr < 0
         ef[:, 1] = rc_arr == cp
+        # Enemy road channels rotate by `n_real` (not 4) so that in 2p/3p
+        # games, the single/two real opponents land in a stable channel
+        # relative to turn order instead of cycling through phantom seats.
+        # Channels beyond the real opponent count remain all zeros (same
+        # convention as flat-feature unused-seat padding).
         for k in range(1, NUM_PLAYERS):
-            ef[:, 1 + k] = rc_arr == (cp + k) % NUM_PLAYERS
+            if k < n_real:
+                ef[:, 1 + k] = rc_arr == (cp + k) % n_real
+            else:
+                ef[:, 1 + k] = 0.0
 
         # ── flat features (115) ──────────────────────────────────────
         # Rotate so the current player is always slot 0, then the other
         # real seats follow in turn order. Unused trailing slots stay 0.
         # Works for 2/3/4-player games — 2p has slots {0, 1} populated,
         # 3p has {0, 1, 2}, 4p has all four.
-        n_real = int(getattr(state, "num_players", NUM_PLAYERS))
-        if n_real <= 0 or n_real > NUM_PLAYERS:
-            n_real = NUM_PLAYERS
         rot_real = [(cp + i) % n_real for i in range(n_real)]
         ps = state.player_state[rot_real].astype(np.float32)
 
