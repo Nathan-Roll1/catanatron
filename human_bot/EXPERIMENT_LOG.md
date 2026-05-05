@@ -328,20 +328,22 @@ Current bot zoo:
 | `eg0150` | 0-ply NN | Strongest pre-distillation Eggroll policy; broad table 1106.5 Elo |
 | `sd0029` | 0-ply NN | H-S winner-trajectory keep; non-transitive, often rises on some seeds |
 | `sd0034` | 0-ply NN | Dense H-S type-head keep; strong no-search anchor |
-| `sd0054` | 0-ply NN | Best broadly re-anchored policy so far |
-| `sd0072` | 0-ply NN | Latest active compact-gate keep; needs broad re-anchor |
+| `sd0054` | 0-ply NN | Current best broadly re-anchored policy |
+| `sd0072` | 0-ply NN | Compact-gate keep that did not beat `sd0054` on broad re-anchor |
 
-Stable broad re-anchor with `sd0054` included, gpc=120, AB2 pinned to 1000:
+Stable broad re-anchor with `sd0054` and `sd0072` included, gpc=120, AB2
+pinned to 1000:
 
 | Rank | Model | Elo | 95% CI | WR |
 |-----:|-------|----:|--------|---:|
-| 1 | `sd0054` | 1110.0 | [1098.7, 1120.7] | 28.1% |
-| 2 | `eg0150` | 1106.5 | [1094.6, 1117.4] | 27.6% |
-| 3 | `sd0029` | 1103.2 | [1091.1, 1113.7] | 27.1% |
-| 4 | `sd0034` | 1101.5 | [1090.1, 1112.6] | 26.9% |
-| 5 | `eg0143` | 1099.5 | [1088.5, 1109.8] | 26.7% |
-| 6 | `m2` | 1066.1 | [1054.2, 1077.9] | 22.7% |
-| 7 | `ab2` | 1000.0 | fixed | 16.0% |
+| 1 | `sd0054` | 1112.0 | [1103.6, 1121.6] | 28.0% |
+| 2 | `sd0072` | 1110.9 | [1102.2, 1119.7] | 27.9% |
+| 3 | `sd0034` | 1104.3 | [1096.0, 1113.5] | 27.1% |
+| 4 | `eg0150` | 1101.8 | [1093.1, 1112.0] | 26.7% |
+| 5 | `sd0029` | 1099.9 | [1090.6, 1109.6] | 26.5% |
+| 6 | `eg0143` | 1099.3 | [1090.1, 1108.8] | 26.4% |
+| 7 | `m2` | 1055.8 | [1046.1, 1064.2] | 21.4% |
+| 8 | `ab2` | 1000.0 | fixed | 16.0% |
 
 Retained or important iterations:
 
@@ -351,7 +353,7 @@ Retained or important iterations:
 | `0041` | keep under old gate | Confirmed +4.2 Elo vs active incumbent, but later broad table put it behind `eg0150`/`sd0034` | Useful but not current high-water |
 | `0045` | rejected after audit | Beat the active incumbent but lost to another historical model in the same table | Triggered corrected best-other gate |
 | `0054` | keep | Tiny `policy_trunk` update from `eg0150`; confirm 1117.4 vs best other 1113.8, broad re-anchor 1110.0 | First real corrected-gate improvement |
-| `0072` | keep | Top-NN-filtered `policy_head` BC from `sd0054`; confirm 1117.3 vs best other `eg0150` 1112.8 | Latest active candidate; next step is broad gpc=120 re-anchor |
+| `0072` | keep but not high-water | Top-NN-filtered `policy_head` BC from `sd0054`; compact confirm 1117.3 vs best other `eg0150` 1112.8, but broad re-anchor 1110.9 vs `sd0054` 1112.0 | Useful near-tie but not current incumbent |
 
 What has helped:
 
@@ -378,11 +380,11 @@ What has not held up:
 Current best practical export:
 
 ```bash
-csrc/nn_weights_candidate.pt   # mirrors kept_iter_0072.pt
-csrc/nn_weights_candidate.bin  # mirrors kept_iter_0072.bin, ignored by git
+csrc/nn_weights_candidate.pt   # mirrors kept_iter_0054.pt
+csrc/nn_weights_candidate.bin  # mirrors kept_iter_0054.bin, ignored by git
 ```
 
-Immediate next autoresearch step after this commit: broad re-anchor `sd0072`
-against `ab2`, `m2`, `eg0143`, `eg0150`, `sd0029`, `sd0034`, and `sd0054` at
-gpc=120 with CIs.  If `sd0072` holds, continue with top-NN-filtered head/trunk
-micro-updates; if it collapses, revert the active incumbent to `sd0054`.
+Immediate next autoresearch step after this commit: keep `sd0054` as the
+incumbent and test more structural data filters/objectives.  `sd0072` shows
+the top-NN filtered head update is close, but broad confirmation says it is not
+yet a replacement.

@@ -13,7 +13,7 @@ csrc/nn_weights_candidate.pt
 csrc/nn_weights_candidate.bin
 ```
 
-These currently mirror `search_distill_m2/kept_iter_0072`.  The binary is a
+These currently mirror `search_distill_m2/kept_iter_0054`.  The binary is a
 local export and is ignored by git; the `.pt` checkpoint is the portable copy.
 
 Important bots:
@@ -26,19 +26,20 @@ Important bots:
 | `eg0150` | 0-ply NN | `autoresearch-results/eggroll_m2_hillclimb/kept_iter_0150.*` | strongest pre-distillation Eggroll policy, around 1106 Elo |
 | `sd0029` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0029.*` | H-S winner-trajectory keep, useful non-transitive anchor |
 | `sd0034` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0034.*` | dense H-S type-head keep, strong in several no-search tables |
-| `sd0054` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0054.*` | best broadly re-anchored policy: 1110.0 Elo vs AB2=1000 on gpc=120 |
-| `sd0072` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0072.*` | latest active compact-gate keep: 1117.3 vs best other 1112.8; still needs broad gpc=120 re-anchor |
+| `sd0054` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0054.*` | current best broadly re-anchored policy |
+| `sd0072` | 0-ply NN | `autoresearch-results/search_distill_m2/kept_iter_0072.*` | compact-gate keep that did not beat `sd0054` on broad re-anchor |
 
-The best validated broad table so far:
+The best validated broad table so far, after the `sd0072` audit:
 
 | Model | Elo | 95% CI | Win rate |
 |-------|----:|--------|---------:|
-| `sd0054` | 1110.0 | [1098.7, 1120.7] | 28.1% |
-| `eg0150` | 1106.5 | [1094.6, 1117.4] | 27.6% |
-| `sd0029` | 1103.2 | [1091.1, 1113.7] | 27.1% |
-| `sd0034` | 1101.5 | [1090.1, 1112.6] | 26.9% |
-| `eg0143` | 1099.5 | [1088.5, 1109.8] | 26.7% |
-| `m2` | 1066.1 | [1054.2, 1077.9] | 22.7% |
+| `sd0054` | 1112.0 | [1103.6, 1121.6] | 28.0% |
+| `sd0072` | 1110.9 | [1102.2, 1119.7] | 27.9% |
+| `sd0034` | 1104.3 | [1096.0, 1113.5] | 27.1% |
+| `eg0150` | 1101.8 | [1093.1, 1112.0] | 26.7% |
+| `sd0029` | 1099.9 | [1090.6, 1109.6] | 26.5% |
+| `eg0143` | 1099.3 | [1090.1, 1108.8] | 26.4% |
+| `m2` | 1055.8 | [1046.1, 1064.2] | 21.4% |
 | `ab2` | 1000.0 | fixed | 16.0% |
 
 Promotion rule now used for 0-ply research: a candidate must beat the **best
